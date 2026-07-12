@@ -14,29 +14,40 @@ from services import llm_client
 
 async def apply_saved_config() -> None:
     # Restore saved LLM config (多厂商: base_url / key / header / prefix / proxy / model_map)
+    llm_provider = await get_config("llm_provider")
     llm_base_url = await get_config("llm_base_url")
     llm_api_key = await get_config("llm_api_key")
     llm_api_key_header = await get_config("llm_api_key_header")
     llm_api_key_prefix = await get_config("llm_api_key_prefix")
     llm_proxy = await get_config("llm_proxy")
     llm_model_map_raw = await get_config("llm_model_map")
+    llm_extra_body_raw = await get_config("llm_extra_body")
     llm_model_map = None
+    llm_extra_body = None
     if llm_model_map_raw:
         try:
             import json as _json
             llm_model_map = _json.loads(llm_model_map_raw)
         except Exception:
             pass
+    if llm_extra_body_raw:
+        try:
+            import json as _json
+            llm_extra_body = _json.loads(llm_extra_body_raw)
+        except Exception:
+            pass
     # 兼容旧键: 老版本只存了 llm_proxy_url
     if not llm_proxy:
         llm_proxy = await get_config("llm_proxy_url") or ""
     llm_client.configure_llm(
+        provider=llm_provider or "",
         base_url=llm_base_url or "",
         api_key=llm_api_key or "",
         api_key_header=llm_api_key_header or "",
         api_key_prefix=llm_api_key_prefix or "",
         proxy=llm_proxy or "",
         model_map=llm_model_map,
+        extra_body=llm_extra_body,
     )
 
     # 本地代理(OKX/外发统一): env CRYPTO_PROXY > DB network_proxy > 自动探测。

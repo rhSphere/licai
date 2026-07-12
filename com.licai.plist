@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  macOS launchd 服务模板: 登录后自启理财助手后端.
+
+  1. 复制本文件为 com.licai.plist
+  2. 把 /Users/bytedance/stock/xuntou/repos/licai/main 全部替换为你的绝对路径 (e.g. /Users/yourname/licai)
+  3. 执行 bash install.sh 注册到 launchd
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.licai</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/bytedance/stock/xuntou/repos/licai/main/run.sh</string>
+        <string>backend</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/bytedance/stock/xuntou/repos/licai/main</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+    <key>StandardOutPath</key>
+    <string>/Users/bytedance/stock/xuntou/repos/licai/main/logs/stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/bytedance/stock/xuntou/repos/licai/main/logs/stderr.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/bytedance/stock/xuntou/repos/licai/main/venv/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>PYTHON</key>
+        <string>/usr/bin/python3</string>
+        <key>VENV</key>
+        <string>venv</string>
+        <key>PYTHONUNBUFFERED</key>
+        <string>1</string>
+        <key>LOG_LEVEL</key>
+        <string>INFO</string>
+    </dict>
+</dict>
+</plist>

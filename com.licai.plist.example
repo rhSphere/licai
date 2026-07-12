@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  macOS launchd 服务模板: 开机自启理财助手.
+  macOS launchd 服务模板: 登录后自启理财助手后端.
 
   1. 复制本文件为 com.licai.plist
   2. 把 __PROJECT_PATH__ 全部替换为你的绝对路径 (e.g. /Users/yourname/licai)
@@ -13,15 +13,21 @@
     <string>com.licai</string>
     <key>ProgramArguments</key>
     <array>
-        <string>__PROJECT_PATH__/venv/bin/python</string>
-        <string>__PROJECT_PATH__/run.py</string>
+        <string>/bin/bash</string>
+        <string>__PROJECT_PATH__/run.sh</string>
+        <string>backend</string>
     </array>
     <key>WorkingDirectory</key>
     <string>__PROJECT_PATH__</string>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
-    <true/>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
     <key>StandardOutPath</key>
     <string>__PROJECT_PATH__/logs/stdout.log</string>
     <key>StandardErrorPath</key>
@@ -29,7 +35,15 @@
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>/usr/local/bin:/usr/bin:/bin</string>
+        <string>__PROJECT_PATH__/venv/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>PYTHON</key>
+        <string>/usr/bin/python3</string>
+        <key>VENV</key>
+        <string>venv</string>
+        <key>PYTHONUNBUFFERED</key>
+        <string>1</string>
+        <key>LOG_LEVEL</key>
+        <string>INFO</string>
     </dict>
 </dict>
 </plist>

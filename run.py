@@ -4,12 +4,50 @@
 """
 from __future__ import annotations
 import asyncio
+import logging
 import os
+import sys
 import warnings
 from contextlib import asynccontextmanager
 
 # macOS 系统 Python 3.9 用 LibreSSL 2.8.3, urllib3 v2 会嗷嗷叫。无害, 屏蔽
 warnings.filterwarnings("ignore", message=".*OpenSSL.*", module="urllib3")
+
+# App logs go to stdout so launchd captures them in logs/stdout.log.  Include
+# timestamps because the backend is often run unattended as a LaunchAgent.
+logging.basicConfig(
+    level=getattr(logging, os.environ.get("LOG_LEVEL", "INFO").upper(), logging.INFO),
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    stream=sys.stdout,
+    force=True,
+)
+_LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+LOGGING_CONFIG = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {
+        "default": {
+            "format": "%(asctime)s %(levelname)s [%(name)s] %(message)s",
+            "datefmt": "%Y-%m-%d %H:%M:%S",
+        },
+        "access": {
+            "format": "%(asctime)s %(levelname)s [%(name)s] %(message)s",
+            "datefmt": "%Y-%m-%d %H:%M:%S",
+        },
+    },
+    "handlers": {
+        "default": {"class": "logging.StreamHandler", "formatter": "default", "stream": "ext://sys.stdout"},
+        "access": {"class": "logging.StreamHandler", "formatter": "access", "stream": "ext://sys.stdout"},
+    },
+    "root": {"handlers": ["default"], "level": _LOG_LEVEL},
+    "loggers": {
+        "uvicorn": {"handlers": ["default"], "level": _LOG_LEVEL, "propagate": False},
+        "uvicorn.error": {"handlers": ["default"], "level": _LOG_LEVEL, "propagate": False},
+        "uvicorn.access": {"handlers": ["access"], "level": _LOG_LEVEL, "propagate": False},
+    },
+}
+logger = logging.getLogger(__name__)
 
 # 清掉所有代理 env, 避免 akshare / requests 走系统代理被 EM/Sina 拒
 for _k in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy"):
@@ -50,6 +88,7 @@ from api.export_routes import router as export_router
 from api.dca_routes import router as dca_router
 from api.news_routes import router as news_router, news_prewarm_loop
 from api.ask_routes import router as ask_router
+from api.health_routes import router as health_router
 from services.sector_matrix import sector_matrix_prewarm_loop
 from services.coiled_scanner import coiled_prewarm_loop
 from services.portfolio_curve import curve_prewarm_loop
@@ -138,7 +177,7 @@ async def lifespan(app: FastAPI):
     if muted_val == "1":
         feishu_notify.set_muted(True)
     if url:
-        print(f"飞书推送 {'静音中' if feishu_notify.is_muted() else '已启用'}")
+        logger.info("飞书推送 %s", "静音中" if feishu_notify.is_muted() else "已启用")
     task1 = asyncio.create_task(price_monitor_loop())
     task2 = asyncio.create_task(backup_loop())
     task3 = asyncio.create_task(briefing_loop())
@@ -157,7 +196,7 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(intraday_loop())
     asyncio.create_task(scheduler_loop())
     task13 = asyncio.create_task(watcher_loop())
-    print(f"理财助手已启动: http://localhost:{config.port}")
+    logger.info("理财助手已启动: http://localhost:%s", config.port)
     yield
     task1.cancel()
     task2.cancel()
@@ -218,6 +257,7 @@ app.include_router(dca_router)
 app.include_router(news_router)
 app.include_router(ask_router)
 app.include_router(broker_router)
+app.include_router(health_router)
 app.include_router(ws_router)
 
 
@@ -277,4 +317,5 @@ if __name__ == "__main__":
         host=config.host,
         port=config.port,
         reload=False,
+        log_config=LOGGING_CONFIG,
     )

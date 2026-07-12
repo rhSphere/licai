@@ -640,7 +640,7 @@ async def news_digest(force: bool = False, max_items: int = 80):
     try:
         raw = await asyncio.to_thread(
             llm_client.call_claude, user_prompt, system_prompt,
-            "claude-sonnet-5", 4000,
+            "balanced", 4000,
         )
     except Exception as e:
         return {"summary": "", "highlights": [], "generated_at": "", "model": "", "error": str(e)[:200], "input_count": len(all_items)}
@@ -658,7 +658,7 @@ async def news_digest(force: bool = False, max_items: int = 80):
         "summary": summary,
         "highlights": highlights,
         "generated_at": now_cst,
-        "model": "claude-sonnet-5",
+        "model": llm_client.resolve_model("balanced"),
         "input_count": len(all_items),
     }
     _cache[cache_key] = (result, time.time())
@@ -828,7 +828,7 @@ async def daily_review(force: bool = False):
     import json as _json
     try:
         raw = await asyncio.to_thread(
-            llm_client.call_claude, user_prompt, system_prompt, "claude-opus-5-5", 1500)
+            llm_client.call_claude, user_prompt, system_prompt, "smart", 1500)
     except Exception as e:
         return {"summary": "复盘生成失败", "holdings": [], "sectors": [], "global": [], "tomorrow": [],
                 "error": str(e)[:160], "cached": False}
@@ -1112,7 +1112,7 @@ async def interpret_news(data: InterpretIn):
         f"新闻正文: {content or '(无正文, 仅标题)'}\n\n请按要求输出 JSON。"
     )
     try:
-        raw = await asyncio.to_thread(_llm.call_claude, user_prompt, _INTERPRET_SYS, "claude-sonnet-5", 600)
+        raw = await asyncio.to_thread(_llm.call_claude, user_prompt, _INTERPRET_SYS, "balanced", 600)
     except Exception:
         return {"what": "", "why": "", "relation": "", "error": "解读暂不可用", "cached": False}
     parsed = None

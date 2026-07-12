@@ -11,8 +11,10 @@ import services.llm_client as llm
 @pytest.fixture(autouse=True)
 def clear_module_state():
     """Reset module globals before each test."""
+    saved_min_interval = llm._MIN_INTERVAL_S
     saved_env = {
         "LLM_BASE_URL": os.environ.pop("LLM_BASE_URL", None),
+        "LLM_PROVIDER": os.environ.pop("LLM_PROVIDER", None),
         "LLM_API_KEY": os.environ.pop("LLM_API_KEY", None),
         "LLM_API_KEY_HEADER": os.environ.pop("LLM_API_KEY_HEADER", None),
         "LLM_API_KEY_PREFIX": os.environ.pop("LLM_API_KEY_PREFIX", None),
@@ -22,14 +24,19 @@ def clear_module_state():
     }
     # Reset module state
     llm._base_url = llm._DEFAULT_BASE_URL
+    llm._provider = llm._DEFAULT_PROVIDER
     llm._api_key = ""
     llm._api_key_header = llm._DEFAULT_API_KEY_HEADER
     llm._api_key_prefix = ""
     llm._model_map = {}
     llm._proxy_url = ""
     llm._cached_token = None
+    llm._MIN_INTERVAL_S = 0
+    llm._last_request_at = 0.0
     llm._apply_proxy()
     yield
+    llm._MIN_INTERVAL_S = saved_min_interval
+    llm._last_request_at = 0.0
     # Restore env
     for k, v in saved_env.items():
         if v is not None:
@@ -63,6 +70,18 @@ def test_build_api_url_trailing_slash():
     assert url == "https://api.siliconflow.cn/v1/messages"
 
 
+def test_build_api_url_kimi_openai_compatible():
+    llm._provider = "openai_compatible"
+    llm._base_url = "https://api.moonshot.cn/v1"
+    assert llm._build_api_url() == "https://api.moonshot.cn/v1/chat/completions"
+
+
+def test_build_api_url_openai_compatible_without_v1():
+    llm._provider = "openai_compatible"
+    llm._base_url = "https://api.example.com"
+    assert llm._build_api_url() == "https://api.example.com/v1/chat/completions"
+
+
 def test_is_anthropic_official():
     llm._base_url = "https://api.anthropic.com"
     assert llm._is_anthropic_official() is True
@@ -91,6 +110,21 @@ def test_resolve_model_unknown_alias():
     assert llm.resolve_model("balanced") == llm._DEFAULT_ALIASES["balanced"]
     # 真正未知的名字 → 原样返回
     assert llm.resolve_model("turbo-x") == "turbo-x"
+
+
+def test_resolve_model_openai_compatible_defaults_to_kimi():
+    llm._provider = "openai_compatible"
+    llm._model_map = {}
+    assert llm.resolve_model("smart") == "kimi-k2.6"
+    assert llm.resolve_model("balanced") == "kimi-k2.6"
+    assert llm.resolve_model("fast") == "kimi-k2.6"
+
+
+def test_resolve_model_openai_compatible_maps_legacy_claude_defaults():
+    llm._provider = "openai_compatible"
+    llm._model_map = {}
+    assert llm.resolve_model("claude-opus-4-8") == "kimi-k2.6"
+    assert llm.resolve_model("claude-sonnet-4-6") == "kimi-k2.6"
 
 
 def test_get_model_map_returns_copy():
@@ -182,6 +216,7 @@ def test_build_system_non_oauth_none():
 
 def test_configure_llm_basic():
     llm.configure_llm(
+        provider="openai_compatible",
         base_url="https://api.deepseek.com",
         api_key="sk-ds-123",
         api_key_header="Authorization",
@@ -189,6 +224,7 @@ def test_configure_llm_basic():
         proxy="http://127.0.0.1:7890",
         model_map={"smart": "deepseek-chat"},
     )
+    assert llm._provider == "openai_compatible"
     assert llm._base_url == "https://api.deepseek.com"
     assert llm._api_key == "sk-ds-123"
     assert llm._api_key_header == "Authorization"
@@ -223,6 +259,7 @@ def test_configure_llm_partial():
 
 def test_get_llm_config_defaults():
     config = llm.get_llm_config()
+    assert config["provider"] == "anthropic"
     assert config["base_url"] == "https://api.anthropic.com"
     assert config["has_api_key"] is False
     assert config["api_key_header"] == "x-api-key"
@@ -350,6 +387,95 @@ def test_resolve_auth_no_credentials_raises():
             llm._resolve_auth()
 
 
+def test_resolve_auth_openai_compatible_requires_llm_key():
+    llm._provider = "openai_compatible"
+    llm._api_key = ""
+    os.environ["ANTHROPIC_API_KEY"] = "sk-ant-should-not-be-used"
+    with pytest.raises(RuntimeError, match="OpenAI-compatible/Kimi"):
+        llm._resolve_auth()
+
+
+def test_openai_message_conversion_tool_roundtrip():
+    messages = [
+        {"role": "user", "content": "查一下贵州茅台"},
+        {"role": "assistant", "content": [
+            {"type": "text", "text": "我先查行情"},
+            {"type": "tool_use", "id": "toolu_1", "name": "get_quote", "input": {"code": "600519"}},
+        ]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "toolu_1", "content": '{"price": 1500}'},
+        ]},
+    ]
+    out = llm._anthropic_messages_to_openai(messages, "system prompt")
+    assert out[0] == {"role": "system", "content": "system prompt"}
+    assert out[2]["tool_calls"][0]["function"]["name"] == "get_quote"
+    assert out[3]["role"] == "tool"
+    assert out[3]["tool_call_id"] == "toolu_1"
+
+
+def test_openai_response_to_anthropic_tool_calls():
+    data = {"id": "x", "model": "kimi-k2.6", "choices": [{"message": {
+        "content": "",
+        "tool_calls": [{"id": "call_1", "type": "function", "function": {
+            "name": "get_quote", "arguments": '{"code":"600519"}'
+        }}]
+    }, "finish_reason": "tool_calls"}]}
+    out = llm._openai_response_to_anthropic(data)
+    assert out["_provider"] == "openai_compatible"
+    assert out["content"][0]["type"] == "tool_use"
+    assert out["content"][0]["input"] == {"code": "600519"}
+
+
+def test_openai_content_to_text_blocks():
+    content = [{"type": "text", "text": "hello"}, {"type": "output_text", "text": " world"}]
+    assert llm._openai_content_to_text(content) == "hello world"
+
+
+def test_openai_response_uses_reasoning_content_when_content_empty():
+    data = {"choices": [{"message": {"content": "", "reasoning_content": "reason text"}}]}
+    out = llm._openai_response_to_anthropic(data)
+    assert out["content"] == [{"type": "text", "text": "reason text"}]
+
+
+@mock.patch.object(llm._llm_session, "post")
+def test_call_claude_openai_compatible(mock_post):
+    mock_resp = mock.MagicMock()
+    mock_resp.ok = True
+    mock_resp.json.return_value = {"choices": [{"message": {"content": "ok"}}]}
+    mock_post.return_value = mock_resp
+    llm._provider = "openai_compatible"
+    llm._base_url = "https://api.moonshot.cn/v1"
+    llm._api_key = "sk-kimi"
+    llm._api_key_header = "Authorization"
+    llm._api_key_prefix = "Bearer"
+
+    assert llm.call_claude("hello", system="sys", model="kimi-k2.6") == "ok"
+    url = mock_post.call_args[0][0]
+    headers = mock_post.call_args.kwargs["headers"]
+    payload = mock_post.call_args.kwargs["json"]
+    assert url == "https://api.moonshot.cn/v1/chat/completions"
+    assert headers["Authorization"] == "Bearer sk-kimi"
+    assert payload["messages"][0] == {"role": "system", "content": "sys"}
+
+
+@mock.patch.object(llm._llm_session, "post")
+def test_call_claude_openai_compatible_json_response_format(mock_post):
+    mock_resp = mock.MagicMock()
+    mock_resp.ok = True
+    mock_resp.json.return_value = {"choices": [{"message": {"content": '{"ok":true}'}}]}
+    mock_post.return_value = mock_resp
+    llm._provider = "openai_compatible"
+    llm._base_url = "https://api.moonshot.cn/v1"
+    llm._api_key = "sk-kimi"
+    llm._api_key_header = "Authorization"
+    llm._api_key_prefix = "Bearer"
+
+    assert llm.call_claude("json", model="fast", response_format="json_object") == '{"ok":true}'
+    payload = mock_post.call_args.kwargs["json"]
+    assert payload["model"] == "kimi-k2.6"
+    assert payload["response_format"] == {"type": "json_object"}
+
+
 @mock.patch("subprocess.run")
 def test_resolve_auth_keychain_success(mock_run):
     """macOS Keychain returns a valid OAuth token."""
@@ -472,6 +598,20 @@ def test_compute_backoff_respects_retry_after():
         assert llm._compute_backoff(0, "invalid") == 1.0
     finally:
         llm._RETRY_MAX_BACKOFF_S = saved_max
+
+
+@mock.patch("time.sleep")
+def test_throttle_before_request_waits_when_enabled(mock_sleep):
+    llm._MIN_INTERVAL_S = 1.2
+    llm._last_request_at = 100.0
+    try:
+        with mock.patch("time.time", side_effect=[100.5, 101.7]):
+            llm._throttle_before_request()
+        assert mock_sleep.called
+        assert round(mock_sleep.call_args[0][0], 1) == 0.7
+    finally:
+        llm._MIN_INTERVAL_S = 0
+        llm._last_request_at = 0.0
 
 
 @mock.patch("time.sleep")  # don't actually sleep

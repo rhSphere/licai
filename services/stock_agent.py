@@ -26,7 +26,7 @@ from services.rule_forge import looks_like_correction as _looks_like_correction
 from services.agent_guides import (CORE as _SYSTEM, ALL_TEXT as _PROMPT_ALL,  # noqa: F401
                                    LOAD_GUIDE_TOOL as _LOAD_GUIDE_TOOL, load_guide as _load_guide)
 
-_MODEL = "claude-opus-5-5"
+_MODEL = "smart"
 _MAX_ROUNDS = 14
 # 自适应思考 + effort: 简单题少查少写, 难题多想。effort 是整体投入档位(low/medium/high)。
 _THINKING = os.environ.get("STOCK_AGENT_THINKING", "1").lower() not in ("0", "false", "no")

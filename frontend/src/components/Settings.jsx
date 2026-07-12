@@ -8,6 +8,9 @@ import { PromptRulesSection } from './settings/PromptRulesSection'
 import { UserMemorySection } from './settings/UserMemorySection'
 import { ProxySection } from './settings/ProxySection'
 import { ZsxqSection } from './settings/ZsxqSection'
+import DataBackup from './DataBackup'
+import BrokerSettings from './BrokerSettings'
+import SystemHealth from './SystemHealth'
 
 
 export default function Settings({ onClose }) {
@@ -104,6 +107,8 @@ export default function Settings({ onClose }) {
         </button>
       </div>
       <div className="p-4 space-y-3">
+        <SystemHealth />
+
         <div>
           <label className="text-[12px] text-text-dim block mb-1">飞书 Webhook URL</label>
           <p className="text-[11px] text-text-muted mb-2">
@@ -201,6 +206,17 @@ export default function Settings({ onClose }) {
         {/* LLM 配置 */}
         <div className="mt-2 pt-4 border-t border-border">
           <LLMConfigSection />
+        </div>
+
+
+        {/* 数据备份 */}
+        <div className="mt-2 pt-4 border-t border-border">
+          <DataBackup />
+        </div>
+
+        {/* 券商费率 */}
+        <div className="mt-2 pt-4 border-t border-border">
+          <BrokerSettings />
         </div>
 
         {/* 知识星球(可选, 只读) */}

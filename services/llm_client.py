@@ -1,16 +1,18 @@
-"""Anthropic-协议兼容 LLM 客户端 (多厂商支持).
+"""LLM 客户端 (Anthropic Messages + OpenAI-compatible/Kimi).
 
 支持的厂商示例:
   - Anthropic 官方:  base_url=https://api.anthropic.com,  header=x-api-key
-  - DeepSeek:        base_url=https://api.deepseek.com, header=Authorization, prefix=Bearer
-  - 硅基流动:         base_url=https://api.siliconflow.cn, header=Authorization, prefix=Bearer
-  - OpenRouter:      base_url=https://openrouter.ai/api, header=Authorization, prefix=Bearer
+  - Kimi/Moonshot:   provider=openai_compatible, base_url=https://api.moonshot.cn/v1,
+                     header=Authorization, prefix=Bearer
+  - OpenAI兼容端点:   provider=openai_compatible, base_url=https://.../v1,
+                     header=Authorization, prefix=Bearer
   - 自定义代理:       任意 base_url + 可配 header
 
 配置优先级 (每一项): 环境变量 > DB 配置 > 默认值
 
 环境变量:
   LLM_BASE_URL         API 基础地址 (不含 /v1/messages)
+  LLM_PROVIDER         anthropic | openai_compatible
   LLM_API_KEY          通用 API key
   LLM_API_KEY_HEADER   鉴权 header 名, 默认 x-api-key
   LLM_API_KEY_PREFIX   鉴权值前缀, 如 Bearer
@@ -42,9 +44,23 @@ logger = logging.getLogger(__name__)
 # ── 默认值 ──────────────────────────────────────────────
 _DEFAULT_BASE_URL = "https://api.anthropic.com"
 _DEFAULT_API_KEY_HEADER = "x-api-key"
+_DEFAULT_PROVIDER = "anthropic"
+_PROVIDER_ALIASES = {
+    "anthropic": "anthropic",
+    "claude": "anthropic",
+    "openai": "openai_compatible",
+    "openai_compatible": "openai_compatible",
+    "openai-compatible": "openai_compatible",
+    "kimi": "openai_compatible",
+    "moonshot": "openai_compatible",
+}
 
 # ── 运行时可变状态 ─────────────────────────────────────
 _base_url: str = os.environ.get("LLM_BASE_URL", "") or _DEFAULT_BASE_URL
+_provider: str = _PROVIDER_ALIASES.get(
+    (os.environ.get("LLM_PROVIDER", "") or _DEFAULT_PROVIDER).strip().lower(),
+    _DEFAULT_PROVIDER,
+)
 _api_key: str = os.environ.get("LLM_API_KEY", "")
 _api_key_header: str = os.environ.get("LLM_API_KEY_HEADER", "") or _DEFAULT_API_KEY_HEADER
 _api_key_prefix: str = os.environ.get("LLM_API_KEY_PREFIX", "")
@@ -114,6 +130,13 @@ _RETRYABLE_EXC = (
     requests.exceptions.ContentDecodingError,
 )
 
+# Kimi/Moonshot may enforce organization-level QPS.  Serialize LLM calls in this
+# process and keep a small configurable gap to avoid stampedes when a page loads
+# multiple AI widgets at once. Set LLM_MIN_INTERVAL=0 to disable.
+_MIN_INTERVAL_S = float(os.environ.get("LLM_MIN_INTERVAL", "1.2"))
+_request_lock = threading.Lock()
+_last_request_at = 0.0
+
 
 # 逻辑别名默认映射: 用户没配自定义 model_map 时, smart/balanced/fast 兜底到真实
 # Anthropic 模型, 否则"fast"会原样发出去被 404(测试连接/默认调用都受影响)。
@@ -121,6 +144,19 @@ _DEFAULT_ALIASES = {
     "smart": "claude-opus-4-8",
     "balanced": "claude-sonnet-5",
     "fast": "claude-sonnet-5",   # 不用 haiku, 最低也走 sonnet
+}
+_OPENAI_COMPAT_ALIASES = {
+    "smart": "kimi-k2.6",
+    "balanced": "kimi-k2.6",
+    "fast": "kimi-k2.6",
+    # Existing callers may pass concrete Claude model names (not aliases), e.g.
+    # stock_agent._MODEL = "claude-opus-4-8".  When the provider is Kimi/OpenAI
+    # compatible, route those legacy defaults to the configured Kimi default
+    # instead of sending an invalid Claude model name to Moonshot/Kimi.
+    "claude-opus-4-8": "kimi-k2.6",
+    "claude-sonnet-4-6": "kimi-k2.6",
+    "claude-sonnet-5": "kimi-k2.6",
+    "claude-haiku-4-5": "kimi-k2.6",
 }
 
 
@@ -132,6 +168,8 @@ def resolve_model(model: str) -> str:
     """
     if model in _model_map:
         return _model_map[model]
+    if _is_openai_compatible():
+        return _OPENAI_COMPAT_ALIASES.get(model, model)
     return _DEFAULT_ALIASES.get(model, model)
 
 
@@ -144,6 +182,7 @@ def get_model_map() -> dict[str, str]:
 
 def configure_llm(
     base_url: str = "",
+    provider: str = "",
     api_key: str = "",
     api_key_header: str = "",
     api_key_prefix: str = "",
@@ -154,9 +193,11 @@ def configure_llm(
 
     环境变量优先级最高, 这里只设置 '没被 env var 覆盖' 的项。
     """
-    global _base_url, _api_key, _api_key_header, _api_key_prefix, _proxy_url, _model_map
+    global _base_url, _provider, _api_key, _api_key_header, _api_key_prefix, _proxy_url, _model_map
 
     with _config_lock:
+        if not os.environ.get("LLM_PROVIDER") and provider:
+            _provider = _normalize_provider(provider)
         if not os.environ.get("LLM_BASE_URL") and base_url:
             _base_url = base_url
         if not os.environ.get("LLM_API_KEY") and api_key:
@@ -175,6 +216,7 @@ def configure_llm(
 def get_llm_config() -> dict:
     """返回当前 LLM 配置 (脱敏, 用于 Settings API)."""
     return {
+        "provider": _provider,
         "base_url": _base_url,
         "api_key": _mask_key(_api_key) if _api_key else "",
         "has_api_key": bool(_api_key),
@@ -190,6 +232,15 @@ def _mask_key(key: str) -> str:
     if len(key) <= 8:
         return "****"
     return key[:4] + "****" + key[-4:]
+
+
+def _normalize_provider(provider: str | None) -> str:
+    p = (provider or "").strip().lower()
+    return _PROVIDER_ALIASES.get(p, _DEFAULT_PROVIDER)
+
+
+def _is_openai_compatible() -> bool:
+    return _provider == "openai_compatible"
 
 
 # ── 内部: 鉴权解析 ─────────────────────────────────────
@@ -215,6 +266,8 @@ _cached_token: str | None = None
 
 def _is_anthropic_official() -> bool:
     """Check if we're talking to api.anthropic.com."""
+    if _provider != "anthropic":
+        return False
     try:
         netloc = urlparse(_base_url).netloc
         return netloc == "api.anthropic.com"
@@ -223,7 +276,14 @@ def _is_anthropic_official() -> bool:
 
 
 def _build_api_url() -> str:
-    """Build the full Messages API URL."""
+    """Build the full API URL for the selected provider."""
+    if _is_openai_compatible():
+        base = _base_url.rstrip("/")
+        if base.endswith("/chat/completions"):
+            return base
+        if base.endswith("/v1"):
+            return base + "/chat/completions"
+        return base + "/v1/chat/completions"
     url = _base_url.rstrip("/") + "/v1/messages"
     if _is_anthropic_official():
         url += "?beta=true"
@@ -243,6 +303,12 @@ def _resolve_auth() -> tuple[str, bool]:
     # ── 通用 API key (优先) ──
     if _api_key:
         return _api_key, False
+
+    if _is_openai_compatible():
+        raise RuntimeError(
+            "无法获取 OpenAI-compatible/Kimi API 凭证。请设置 LLM_API_KEY, "
+            "或在 Settings 页面配置 API key。"
+        )
 
     # ── Anthropic 官方 API key (兼容旧版) ──
     env_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
@@ -283,13 +349,12 @@ def _build_headers(token: str, is_oauth: bool) -> dict:
         return headers
 
     # ── 通用 API key 模式 ──
-    headers = {
-        "Content-Type": "application/json",
-        "anthropic-version": "2023-06-01",
-    }
+    headers = {"Content-Type": "application/json"}
+    if not _is_openai_compatible():
+        headers["anthropic-version"] = "2023-06-01"
 
     if _api_key_header.lower() == "authorization":
-        prefix = (_api_key_prefix + " ").strip() + " " if _api_key_prefix else ""
+        prefix = f"{_api_key_prefix.strip()} " if _api_key_prefix.strip() else ""
         headers["Authorization"] = f"{prefix}{token}".strip()
     else:
         if _api_key_prefix:
@@ -313,6 +378,181 @@ def _build_system(system: str | None, is_oauth: bool):
     return system
 
 
+def _anthropic_content_to_text(content) -> str:
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for b in content:
+            if not isinstance(b, dict):
+                continue
+            if b.get("type") == "text":
+                parts.append(b.get("text") or "")
+            elif b.get("type") == "tool_result":
+                c = b.get("content")
+                parts.append(c if isinstance(c, str) else json.dumps(c, ensure_ascii=False))
+        return "\n".join(p for p in parts if p)
+    return str(content)
+
+
+def _openai_content_to_text(content) -> str:
+    """Extract text from OpenAI-compatible message.content.
+
+    Most providers return a string, while some return content blocks. Kimi Code
+    compatible gateways may also leave content empty when the useful text is in
+    reasoning_content; callers handle that fallback separately.
+    """
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for b in content:
+            if isinstance(b, str):
+                parts.append(b)
+            elif isinstance(b, dict):
+                if b.get("type") in ("text", "output_text"):
+                    parts.append(b.get("text") or b.get("content") or "")
+                elif isinstance(b.get("text"), str):
+                    parts.append(b.get("text") or "")
+        return "".join(parts)
+    return str(content)
+
+
+def _openai_user_content(content):
+    """Convert Anthropic text/image user content to OpenAI-compatible content."""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return str(content)
+
+    out = []
+    for b in content:
+        if not isinstance(b, dict):
+            continue
+        typ = b.get("type")
+        if typ == "text":
+            out.append({"type": "text", "text": b.get("text") or ""})
+        elif typ == "image":
+            src = b.get("source") or {}
+            media = src.get("media_type") or "image/png"
+            data = src.get("data") or ""
+            if data:
+                out.append({"type": "image_url", "image_url": {"url": f"data:{media};base64,{data}"}})
+    return out or _anthropic_content_to_text(content)
+
+
+def _anthropic_messages_to_openai(messages: list, system: str | None) -> list:
+    """Convert Anthropic Messages API format to OpenAI Chat Completions format."""
+    out = []
+    if system:
+        out.append({"role": "system", "content": system})
+
+    for m in messages:
+        role = m.get("role")
+        content = m.get("content")
+
+        if role == "assistant" and isinstance(content, list):
+            text_parts = [b.get("text") or "" for b in content
+                          if isinstance(b, dict) and b.get("type") == "text"]
+            tool_uses = [b for b in content
+                         if isinstance(b, dict) and b.get("type") == "tool_use"]
+            msg = {"role": "assistant", "content": "".join(text_parts) or None}
+            if tool_uses:
+                msg["tool_calls"] = []
+                for tu in tool_uses:
+                    msg["tool_calls"].append({
+                        "id": tu.get("id") or str(uuid.uuid4()),
+                        "type": "function",
+                        "function": {
+                            "name": tu.get("name") or "unknown_tool",
+                            "arguments": json.dumps(tu.get("input") or {}, ensure_ascii=False),
+                        },
+                    })
+            out.append(msg)
+            continue
+
+        if role == "user" and isinstance(content, list) and all(
+            isinstance(b, dict) and b.get("type") == "tool_result" for b in content
+        ):
+            for tr in content:
+                c = tr.get("content")
+                out.append({
+                    "role": "tool",
+                    "tool_call_id": tr.get("tool_use_id") or str(uuid.uuid4()),
+                    "content": c if isinstance(c, str) else json.dumps(c, ensure_ascii=False),
+                })
+            continue
+
+        if role == "user":
+            out.append({"role": "user", "content": _openai_user_content(content)})
+        elif role == "assistant":
+            out.append({"role": "assistant", "content": _anthropic_content_to_text(content)})
+    return out
+
+
+def _anthropic_tools_to_openai(tools: list | None) -> list | None:
+    if not tools:
+        return None
+    out = []
+    for t in tools:
+        if not isinstance(t, dict):
+            continue
+        # Anthropic server tools such as web_search_20250305 cannot be sent to Kimi/OpenAI.
+        if t.get("type", "custom") != "custom" and not t.get("name"):
+            continue
+        name = t.get("name")
+        if not name:
+            continue
+        out.append({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": t.get("description") or "",
+                "parameters": t.get("input_schema") or {"type": "object", "properties": {}},
+            },
+        })
+    return out or None
+
+
+def _openai_response_to_anthropic(data: dict) -> dict:
+    choices = data.get("choices") or []
+    msg = (choices[0].get("message") if choices else {}) or {}
+    content = []
+    text = _openai_content_to_text(msg.get("content"))
+    if not text and isinstance(msg.get("reasoning_content"), str):
+        text = msg.get("reasoning_content") or ""
+    if text:
+        content.append({"type": "text", "text": text})
+    for tc in msg.get("tool_calls") or []:
+        fn = tc.get("function") or {}
+        raw_args = fn.get("arguments") or "{}"
+        try:
+            args = json.loads(raw_args) if isinstance(raw_args, str) else (raw_args or {})
+        except Exception:
+            args = {"_raw": raw_args}
+        content.append({
+            "type": "tool_use",
+            "id": tc.get("id") or str(uuid.uuid4()),
+            "name": fn.get("name") or "unknown_tool",
+            "input": args,
+        })
+    finish = choices[0].get("finish_reason") if choices else None
+    return {
+        "id": data.get("id", ""),
+        "type": "message",
+        "role": "assistant",
+        "model": data.get("model", ""),
+        "content": content,
+        "stop_reason": "tool_use" if msg.get("tool_calls") else (finish or "end_turn"),
+        "usage": data.get("usage") or {},
+        "_provider": "openai_compatible",
+    }
+
+
 def _post_with_fallback(headers: dict, payload: dict) -> requests.Response:
     """POST to API, falling back to direct if proxy errors."""
     api_url = _build_api_url()
@@ -330,6 +570,20 @@ def _compute_backoff(attempt: int, retry_after: str | None) -> float:
         except (ValueError, TypeError):
             pass
     return min(_RETRY_INITIAL_BACKOFF_S * (2 ** attempt), _RETRY_MAX_BACKOFF_S)
+
+
+def _throttle_before_request() -> None:
+    """Global in-process LLM throttle to reduce provider 429s."""
+    global _last_request_at
+    if _MIN_INTERVAL_S <= 0:
+        return
+    with _request_lock:
+        now = time.time()
+        wait = _MIN_INTERVAL_S - (now - _last_request_at)
+        if wait > 0:
+            time.sleep(wait)
+            now = time.time()
+        _last_request_at = now
 
 
 def _post_with_retry(headers: dict, payload: dict) -> requests.Response:
@@ -355,10 +609,12 @@ def _post_with_retry(headers: dict, payload: dict) -> requests.Response:
 
     for attempt in range(_MAX_RETRIES + 1):
         try:
+            _throttle_before_request()
             resp = _llm_session.post(api_url, headers=headers, json=payload, timeout=_HTTP_TIMEOUT)
         except requests.exceptions.ProxyError:
             # Proxy unreachable, try direct session once per attempt
             try:
+                _throttle_before_request()
                 resp = _direct_session.post(api_url, headers=headers, json=payload, timeout=_HTTP_TIMEOUT)
             except _RETRYABLE_EXC as e:
                 last_exc = e
@@ -464,6 +720,7 @@ def call_claude(
     system: str | None = None,
     model: str = "claude-sonnet-5",
     max_tokens: int = 2048,
+    response_format: str | None = None,
 ) -> str:
     """Call LLM API (Anthropic-协议兼容). Returns text response.
 
@@ -478,12 +735,23 @@ def call_claude(
     token, is_oauth = _resolve_auth()
     headers = _build_headers(token, is_oauth)
     system_blocks = _build_system(system, is_oauth)
-    payload = {
-        "model": model,
-        "max_tokens": max_tokens,
-        "messages": [{"role": "user", "content": user_prompt}],
-        "system": system_blocks,
-    }
+    if _is_openai_compatible():
+        payload = {
+            "model": model,
+            "max_tokens": max_tokens,
+            "messages": _anthropic_messages_to_openai(
+                [{"role": "user", "content": user_prompt}], system or ""
+            ),
+        }
+        if response_format == "json_object":
+            payload["response_format"] = {"type": "json_object"}
+    else:
+        payload = {
+            "model": model,
+            "max_tokens": max_tokens,
+            "messages": [{"role": "user", "content": user_prompt}],
+            "system": system_blocks,
+        }
 
     resp = _post_with_retry(headers, payload)
     resp = _retry_on_oauth_401(resp, token, is_oauth, system, headers, payload)
@@ -497,6 +765,19 @@ def call_claude(
         raise RuntimeError(f"LLM API error {resp.status_code}: {_safe_error_body(resp)}")
 
     data = resp.json()
+    if _is_openai_compatible():
+        choices = data.get("choices") or []
+        msg = (choices[0].get("message") if choices else {}) or {}
+        text = _openai_content_to_text(msg.get("content"))
+        if not text and isinstance(msg.get("reasoning_content"), str):
+            text = msg.get("reasoning_content") or ""
+        if not text:
+            finish = choices[0].get("finish_reason") if choices else None
+            logger.warning(
+                "OpenAI-compatible LLM returned empty content: finish_reason=%r message_keys=%s",
+                finish, sorted(msg.keys()) if isinstance(msg, dict) else [],
+            )
+        return text
     parts = data.get("content", [])
     return "".join(p.get("text", "") for p in parts if p.get("type") == "text")
 
@@ -518,14 +799,24 @@ def call_claude_messages(
     headers = _build_headers(token, is_oauth)
     system_blocks = _build_system(system, is_oauth)
 
-    payload = {
-        "model": model,
-        "max_tokens": max_tokens,
-        "messages": messages,
-        "system": system_blocks,
-    }
-    if tools:
-        payload["tools"] = tools
+    if _is_openai_compatible():
+        payload = {
+            "model": model,
+            "max_tokens": max_tokens,
+            "messages": _anthropic_messages_to_openai(messages, system or ""),
+        }
+        ot = _anthropic_tools_to_openai(tools)
+        if ot:
+            payload["tools"] = ot
+    else:
+        payload = {
+            "model": model,
+            "max_tokens": max_tokens,
+            "messages": messages,
+            "system": system_blocks,
+        }
+        if tools:
+            payload["tools"] = tools
 
     resp = _post_with_retry(headers, payload)
     resp = _retry_on_oauth_401(resp, token, is_oauth, system, headers, payload)
@@ -533,7 +824,10 @@ def call_claude_messages(
     if not resp.ok:
         raise RuntimeError(f"LLM API error {resp.status_code}: {_safe_error_body(resp)}")
 
-    return resp.json()
+    data = resp.json()
+    if _is_openai_compatible():
+        return _openai_response_to_anthropic(data)
+    return data
 
 
 # ── 连接测试 ───────────────────────────────────────────
@@ -550,21 +844,30 @@ def test_connection() -> dict:
         token, is_oauth = _resolve_auth()
         headers = _build_headers(token, is_oauth)
         system_blocks = _build_system("Reply with just 'ok'.", is_oauth)
-        payload = {
-            "model": model,
-            "max_tokens": 10,
-            "messages": [{"role": "user", "content": "Say ok"}],
-            "system": system_blocks,
-        }
+        if _is_openai_compatible():
+            payload = {
+                "model": model,
+                "max_tokens": 10,
+                "messages": _anthropic_messages_to_openai(
+                    [{"role": "user", "content": "Say ok"}], "Reply with just 'ok'."
+                ),
+            }
+        else:
+            payload = {
+                "model": model,
+                "max_tokens": 10,
+                "messages": [{"role": "user", "content": "Say ok"}],
+                "system": system_blocks,
+            }
         resp = _post_with_retry(headers, payload)
         elapsed_ms = round((time.time() - t0) * 1000)
         if resp.ok:
-            return {"ok": True, "latency_ms": elapsed_ms, "model": model, "error": ""}
+            return {"ok": True, "latency_ms": elapsed_ms, "model": model, "provider": _provider, "error": ""}
         else:
-            return {"ok": False, "latency_ms": elapsed_ms, "model": model, "error": f"{resp.status_code}: {_safe_error_body(resp)}"}
+            return {"ok": False, "latency_ms": elapsed_ms, "model": model, "provider": _provider, "error": f"{resp.status_code}: {_safe_error_body(resp)}"}
     except Exception as e:
         elapsed_ms = round((time.time() - t0) * 1000)
-        return {"ok": False, "latency_ms": elapsed_ms, "model": model, "error": str(e)[:200]}
+        return {"ok": False, "latency_ms": elapsed_ms, "model": model, "provider": _provider, "error": str(e)[:200]}
 
 
 # ── CLI fallback (仅 Anthropic 官方 + OAuth 模式) ──────

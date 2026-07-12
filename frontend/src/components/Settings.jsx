@@ -1,5 +1,8 @@
 import { useState, useEffect } from 'react'
 import { api, fetchJSON } from '../hooks/useApi'
+import DataBackup from './DataBackup'
+import BrokerSettings from './BrokerSettings'
+import SystemHealth from './SystemHealth'
 
 export default function Settings({ onClose }) {
   const [url, setUrl] = useState('')
@@ -15,7 +18,7 @@ export default function Settings({ onClose }) {
   const [okxSaving, setOkxSaving] = useState(false)
 
   const loadOkxStatus = async () => {
-    try { setOkxStatus(await fetchJSON('/api/assets/okx/status')) } catch {}
+    try { setOkxStatus(await fetchJSON('/api/assets/okx/status')) } catch { setOkxStatus(null) }
   }
 
   useEffect(() => {
@@ -60,7 +63,9 @@ export default function Settings({ onClose }) {
       await fetchJSON('/api/assets/okx/credentials', { method: 'DELETE' })
       setOkxStatusText({ text: '已清除', ok: true })
       await loadOkxStatus()
-    } catch {}
+    } catch (e) {
+      setOkxStatusText({ text: '清除失败：' + (e.message || e), ok: false })
+    }
   }
 
   const handleSave = async () => {
@@ -95,6 +100,8 @@ export default function Settings({ onClose }) {
         </button>
       </div>
       <div className="p-4 space-y-3">
+        <SystemHealth />
+
         <div>
           <label className="text-[12px] text-text-dim block mb-1">飞书 Webhook URL</label>
           <p className="text-[11px] text-text-muted mb-2">
@@ -193,6 +200,16 @@ export default function Settings({ onClose }) {
         <div className="mt-2 pt-4 border-t border-border">
           <LLMConfigSection />
         </div>
+
+        {/* 数据备份 */}
+        <div className="mt-2 pt-4 border-t border-border">
+          <DataBackup />
+        </div>
+
+        {/* 券商费率 */}
+        <div className="mt-2 pt-4 border-t border-border">
+          <BrokerSettings />
+        </div>
       </div>
     </section>
   )
@@ -283,6 +300,7 @@ function ProxySection() {
 }
 
 function LLMConfigSection() {
+  const [provider, setProvider] = useState('anthropic')
   const [baseUrl, setBaseUrl] = useState('')
   const [apiKey, setApiKey] = useState('')
   const [apiKeyHeader, setApiKeyHeader] = useState('x-api-key')
@@ -296,6 +314,7 @@ function LLMConfigSection() {
 
   useEffect(() => {
     api.getLLMConfig().then(d => {
+      setProvider(d.db_provider || 'anthropic')
       setBaseUrl(d.db_base_url || '')
       setDbHasKey(d.has_api_key)
       setApiKeyHeader(d.db_api_key_header || 'x-api-key')
@@ -317,6 +336,7 @@ function LLMConfigSection() {
         }
       }
       await api.saveLLMConfig({
+        provider,
         base_url: baseUrl.trim(),
         api_key: apiKey.trim() || (dbHasKey ? '****' : ''),
         api_key_header: apiKeyHeader.trim() || 'x-api-key',
@@ -354,16 +374,44 @@ function LLMConfigSection() {
     <>
       <label className="text-[12px] text-text-dim font-semibold">LLM 配置</label>
       <p className="text-[11px] text-text-muted mb-2 leading-relaxed">
-        支持 Anthropic 协议兼容的 API 端点（DeepSeek / 硅基流动 / OpenRouter 等）。
+        支持 Anthropic Messages 协议，以及 Kimi/Moonshot 等 OpenAI-compatible 接口。
         不配置则走原有 Anthropic 官方 + Keychain OAuth。
       </p>
 
       <div className="grid grid-cols-1 gap-2 mb-2">
         <div>
+          <label className="text-[11px] text-text-muted">Provider</label>
+          <select
+            className="w-full bg-bg border border-border rounded px-3 py-1.5 text-[12px] text-text outline-none focus:border-accent"
+            value={provider}
+            onChange={e => {
+              const v = e.target.value
+              setProvider(v)
+              if (v === 'openai_compatible') {
+                setBaseUrl(prev => prev || 'https://api.moonshot.cn/v1')
+                setApiKeyHeader('Authorization')
+                setApiKeyPrefix('Bearer')
+                setModelMap(prev => prev || JSON.stringify({ smart: 'kimi-k2.6', balanced: 'kimi-k2.6', fast: 'kimi-k2.6' }, null, 2))
+              } else {
+                setBaseUrl(prev => prev || 'https://api.anthropic.com')
+                setApiKeyHeader('x-api-key')
+                setApiKeyPrefix('')
+              }
+            }}
+          >
+            <option value="anthropic">Anthropic / Claude</option>
+            <option value="openai_compatible">OpenAI-compatible / Kimi</option>
+          </select>
+          <p className="text-[10px] text-text-muted mt-0.5">
+            Kimi 使用 OpenAI-compatible: https://api.moonshot.cn/v1 + Authorization: Bearer。
+          </p>
+        </div>
+
+        <div>
           <label className="text-[11px] text-text-muted">API Base URL</label>
           <input
             className="w-full bg-bg border border-border rounded px-3 py-1.5 text-[12px] text-text font-mono outline-none focus:border-accent"
-            placeholder="https://api.anthropic.com"
+            placeholder={provider === 'openai_compatible' ? 'https://api.moonshot.cn/v1' : 'https://api.anthropic.com'}
             value={baseUrl} onChange={e => setBaseUrl(e.target.value)}
           />
         </div>
@@ -409,7 +457,7 @@ function LLMConfigSection() {
           <label className="text-[11px] text-text-muted">模型别名映射（JSON，可选）</label>
           <textarea rows={3}
             className="w-full bg-bg border border-border rounded px-3 py-1.5 text-[12px] text-text font-mono outline-none focus:border-accent resize-none"
-            placeholder='{"smart":"deepseek-chat","balanced":"deepseek-chat","fast":"deepseek-chat"}'
+            placeholder={provider === 'openai_compatible' ? '{"smart":"kimi-k2.6","balanced":"kimi-k2.6","fast":"kimi-k2.6"}' : '{"smart":"claude-opus-4-8","balanced":"claude-sonnet-4-6","fast":"claude-sonnet-4-6"}'}
             value={modelMap} onChange={e => setModelMap(e.target.value)}
           />
           <p className="text-[10px] text-text-muted mt-0.5">逻辑名: smart / balanced / fast → 实际模型名</p>

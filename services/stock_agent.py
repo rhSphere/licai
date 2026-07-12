@@ -12,7 +12,7 @@ import time as _time
 
 import services.llm_client as _llm
 
-_MODEL = "claude-opus-4-8"
+_MODEL = "smart"
 _MAX_ROUNDS = 14
 
 # A 股 代码↔名称 表 (akshare, 缓存 12h, 供按名字解析)

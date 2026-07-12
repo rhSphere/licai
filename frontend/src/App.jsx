@@ -6,6 +6,8 @@ import Sidebar from './components/Sidebar'
 import Dashboard from './components/Dashboard'
 import RiskBanner from './components/RiskBanner'
 import UnifiedPortfolio from './components/UnifiedPortfolio'
+import UnwindView from './components/UnwindView'
+import DCAManager from './components/DCAManager'
 import Rankings from './components/Rankings'
 import StockAsk from './components/StockAsk'
 import Settings from './components/Settings'
@@ -13,6 +15,7 @@ import EditModal from './components/EditModal'
 import TransactionHistory from './components/TransactionHistory'
 // 板块
 import MorningBriefing from './components/MorningBriefing'
+import MarketAIInsights from './components/MarketAIInsights'
 import SentimentThermometer from './components/SentimentThermometer'
 import SectorMatrix from './components/SectorMatrix'
 import HotRank from './components/HotRank'
@@ -25,6 +28,9 @@ import EtfXray from './components/EtfXray'
 import PortfolioNews from './components/PortfolioNews'
 // 复盘
 import AITradeReview from './components/AITradeReview'
+import TradeReview from './components/TradeReview'
+import TradeJournal from './components/TradeJournal'
+import ThesisReview from './components/ThesisReview'
 import BenchmarkCompare from './components/BenchmarkCompare'
 import Cashflow from './components/Cashflow'
 import AllocationAdvisor from './components/AllocationAdvisor'
@@ -36,7 +42,7 @@ export default function App() {
   const [editTarget, setEditTarget] = useState(null)
   const [historyTarget, setHistoryTarget] = useState(null)
   const [lastUpdate, setLastUpdate] = useState(null)
-  const _VIEWS = ['portfolio', 'sector', 'rankings', 'macro', 'news', 'review', 'ask', 'settings']
+  const _VIEWS = ['portfolio', 'unwind', 'sector', 'rankings', 'macro', 'news', 'review', 'ask', 'settings']
   const [view, _setView] = useState(() => {
     // 支持 #view?k=v 形式的 deep-link(子参数由各组件自行读取)
     const h = (window.location.hash || '').slice(1).split('?')[0]
@@ -120,12 +126,20 @@ export default function App() {
                 onAdd={handleHoldingChange}
                 dataVersion={dataVersion}
               />
+              <DCAManager />
+            </div>
+          )}
+
+          {view === 'unwind' && (
+            <div className={`${PAD} space-y-3 md:space-y-4`}>
+              <UnwindView />
             </div>
           )}
 
           {view === 'sector' && (
             <div className={`${PAD} space-y-3 md:space-y-4`}>
               <MorningBriefing />
+              <MarketAIInsights />
               <SentimentThermometer />
               <EtfXray />
               <SectorMatrix />
@@ -156,6 +170,9 @@ export default function App() {
           {view === 'review' && (
             <div className={`${PAD} space-y-3 md:space-y-4`}>
               <AITradeReview />
+              <TradeReview />
+              <TradeJournal />
+              <ThesisReview />
               <BenchmarkCompare />
               <Cashflow />
               <AllocationAdvisor />

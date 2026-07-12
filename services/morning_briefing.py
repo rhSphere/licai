@@ -11,6 +11,7 @@ for the rest of the day. User reads it once, no real-time noise.
 from __future__ import annotations
 import asyncio
 import json
+import os
 import re
 from datetime import datetime, timezone, timedelta
 from typing import Any
@@ -114,8 +115,92 @@ def _build_user_prompt(*, stock_code: str, stock_name: str, current_price: float
 
 def _strip_to_json(text: str) -> str:
     """Best-effort: pull the first {...} block out of an LLM response."""
+    text = (text or "").strip()
+    # tolerate ```json ... ``` wrappers
+    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE).strip()
+    text = re.sub(r"\s*```$", "", text).strip()
     m = re.search(r"\{.*\}", text, re.DOTALL)
     return m.group(0) if m else text
+
+
+def _coerce_points(v) -> list[str]:
+    if isinstance(v, list):
+        return [str(x).strip()[:80] for x in v if str(x).strip()][:4]
+    if isinstance(v, str) and v.strip():
+        return [v.strip()[:80]]
+    return []
+
+
+def _parse_llm_briefing(raw: str) -> dict:
+    """Parse a strict briefing JSON response from LLM.
+
+    Kimi/OpenAI-compatible models sometimes wrap JSON in markdown fences. This
+    parser accepts fenced JSON but still raises for empty/non-JSON responses so
+    callers can fall back to a useful local summary instead of showing a broken
+    card.
+    """
+    body = _strip_to_json(raw)
+    if not body:
+        raise ValueError("empty LLM response")
+    parsed = json.loads(body)
+    if not isinstance(parsed, dict):
+        raise ValueError("LLM response is not a JSON object")
+    signal = parsed.get("signal") or "中性"
+    if signal not in {"偏暖", "中性", "偏冷", "警惕"}:
+        signal = "中性"
+    conf = parsed.get("confidence") or "med"
+    if conf not in {"high", "med", "low"}:
+        conf = "med"
+    return {
+        "signal": signal,
+        "summary": str(parsed.get("summary") or "").strip()[:80],
+        "points": _coerce_points(parsed.get("points")),
+        "risk": str(parsed.get("risk") or "").strip()[:120],
+        "confidence": conf,
+    }
+
+
+def _fallback_briefing_from_inputs(*, raw: str, kline_stats: dict, news: list[dict],
+                                   announcements: list[dict], health: dict | None) -> dict:
+    """Build a usable low-confidence card when LLM output is not valid JSON."""
+    points: list[str] = []
+    if announcements:
+        title = (announcements[0].get("title") or "").strip()
+        if title:
+            points.append(f"近期公告: {title[:50]}")
+    if news and len(points) < 4:
+        title = (news[0].get("title") or "").strip()
+        if title:
+            points.append(f"近期新闻: {title[:50]}")
+    if kline_stats and len(points) < 4:
+        trend = kline_stats.get("趋势")
+        close = kline_stats.get("最新收盘")
+        if trend or close:
+            points.append(f"K线摘要: 最新收盘 {close or '--'}, 趋势 {trend or '未知'}")
+    if health and len(points) < 4:
+        points.append(f"基本面健康度: {health.get('level') or '未知'}, 评分 {health.get('score', 0):+.2f}")
+
+    raw_text = (raw or "").strip()
+    if raw_text:
+        # Use the first meaningful non-markdown line as a fallback summary.
+        for line in raw_text.splitlines():
+            line = re.sub(r"^[#>*\-\s]+", "", line).strip()
+            if line and not line.startswith("```"):
+                return {
+                    "signal": "中性",
+                    "summary": line[:60],
+                    "points": points,
+                    "risk": "",
+                    "confidence": "low",
+                }
+
+    return {
+        "signal": "中性",
+        "summary": "LLM 未返回结构化内容，已展示本地摘要",
+        "points": points,
+        "risk": "",
+        "confidence": "low",
+    }
 
 
 async def generate_briefing_for_stock(stock_code: str, stock_name: str,
@@ -167,19 +252,32 @@ async def generate_briefing_for_stock(stock_code: str, stock_name: str,
     try:
         raw = await asyncio.to_thread(
             call_claude, user_prompt, SYSTEM_PROMPT,
-            "claude-sonnet-5", 1200,
+            "fast", 1200, "json_object",
         )
-        parsed = json.loads(_strip_to_json(raw))
+        parsed = _parse_llm_briefing(raw)
     except Exception as e:
+        fallback = _fallback_briefing_from_inputs(
+            raw=locals().get("raw", ""),
+            kline_stats=kline_stats,
+            news=news or [],
+            announcements=announcements or [],
+            health=health,
+        )
         return {
             "stock_code": stock_code,
             "stock_name": stock_name,
-            "error": f"生成失败: {type(e).__name__}: {str(e)[:100]}",
-            "signal": "中性",
-            "summary": "LLM 调用失败",
-            "points": [],
-            "risk": "",
-            "confidence": "low",
+            "current_price": current_price,
+            "cost_price": cost_price,
+            "pnl_pct": round(pnl_pct, 2),
+            "sector": sector,
+            "error": f"LLM 未返回严格 JSON，已降级展示: {type(e).__name__}: {str(e)[:80]}",
+            "signal": fallback["signal"],
+            "summary": fallback["summary"],
+            "points": fallback["points"],
+            "risk": fallback["risk"],
+            "confidence": fallback["confidence"],
+            "kline_stats": kline_stats,
+            "health_level": (health or {}).get("level"),
         }
 
     return {
@@ -231,8 +329,13 @@ async def generate_all_briefings() -> list[dict]:
 
     today = (datetime.now(timezone.utc) + timedelta(hours=8)).strftime("%Y-%m-%d")
     results: list[dict] = []
-    # Run sequentially to be polite to the akshare news endpoint
-    for h in holdings:
+    # Run sequentially to be polite to both the akshare news endpoint and LLM
+    # provider org-level rate limits. Kimi/Moonshot may return 429 when many
+    # cards are generated back-to-back; keep a small configurable gap.
+    llm_gap = max(0.0, float(os.environ.get("LLM_BRIEFING_DELAY", "1.2") or 0))
+    for idx, h in enumerate(holdings):
+        if idx > 0 and llm_gap > 0:
+            await asyncio.sleep(llm_gap)
         code = h["stock_code"]
         q = quotes.get(code) or {}
         cur = q.get("price") or 0

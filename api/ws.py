@@ -2,6 +2,7 @@
 from __future__ import annotations
 import asyncio
 import json
+import logging
 import time
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
@@ -11,6 +12,7 @@ from services import feishu_notify
 from config import config
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 _clients: set[WebSocket] = set()
 
@@ -79,7 +81,7 @@ async def price_monitor_loop():
 
             await asyncio.sleep(interval)
         except Exception as e:
-            print(f"[monitor] Error: {e}")
+            logger.exception("price monitor error: %s", e)
             await asyncio.sleep(10)
 
 
@@ -110,7 +112,7 @@ async def backup_loop():
                     dst = backup_dir / f"portfolio_{today}.db"
                     shutil.copy2(str(src), str(dst))
                     _backup_done_date = today
-                    print(f"[backup] Database backed up to {dst}")
+                    logger.info("database backed up to %s", dst)
 
                     # Keep only last 30 backups
                     backups = sorted(backup_dir.glob("portfolio_*.db"))
@@ -119,7 +121,7 @@ async def backup_loop():
 
             await asyncio.sleep(300)  # check every 5 minutes
         except Exception as e:
-            print(f"[backup] Error: {e}")
+            logger.exception("backup loop error: %s", e)
             await asyncio.sleep(300)
 
 
@@ -145,11 +147,11 @@ async def briefing_loop():
             # Window: weekdays 8:55 ~ 9:10 CST, once per day
             if (cst_now.weekday() < 5 and 535 <= t <= 550
                     and today != _briefing_done_date):
-                print(f"[briefing] Generating morning briefings for {today}")
+                logger.info("generating morning briefings for %s", today)
                 try:
                     results = await generate_all_briefings()
                     _briefing_done_date = today
-                    print(f"[briefing] Done: {len(results)} briefings saved")
+                    logger.info("morning briefings done: %d saved", len(results))
                     # Push a one-line summary to feishu (signal 模型: 客观信息倾向, 非操作建议)
                     if feishu_notify.is_enabled() and results:
                         lines = [f"📋 {today} 早盘简报"]
@@ -161,11 +163,11 @@ async def briefing_loop():
                             )
                         await feishu_notify.send_text("\n".join(lines))
                 except Exception as e:
-                    print(f"[briefing] Generation failed: {e}")
+                    logger.exception("morning briefing generation failed: %s", e)
 
             await asyncio.sleep(60)
         except Exception as e:
-            print(f"[briefing] Loop error: {e}")
+            logger.exception("briefing loop error: %s", e)
             await asyncio.sleep(120)
 
 
@@ -191,7 +193,7 @@ async def dca_loop():
                     fired = await fire_due_dcas()
                     _dca_done_date = today
                     if fired:
-                        print(f"[dca] Fired {len(fired)} schedules on {today}")
+                        logger.info("fired %d DCA schedules on %s", len(fired), today)
                         if feishu_notify.is_enabled():
                             lines = [f"💸 {today} 定投触发 {len(fired)} 笔"]
                             for f in fired:
@@ -200,9 +202,9 @@ async def dca_loop():
                                 lines.append(f"  asset#{f['asset_id']} {unit}{v} → action #{f['action_id']} (pending)")
                             await feishu_notify.send_text("\n".join(lines))
                 except Exception as e:
-                    print(f"[dca] fire_due_dcas failed: {e}")
+                    logger.exception("fire_due_dcas failed: %s", e)
 
             await asyncio.sleep(60)
         except Exception as e:
-            print(f"[dca] Loop error: {e}")
+            logger.exception("dca loop error: %s", e)
             await asyncio.sleep(120)

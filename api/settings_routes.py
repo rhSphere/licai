@@ -181,6 +181,7 @@ _LLM_TEST_COOLDOWN_S = 5  # minimum seconds between test calls
 
 
 class LLMConfig(BaseModel):
+    provider: str = "anthropic"
     base_url: str = ""
     api_key: str = ""
     api_key_header: str = "x-api-key"
@@ -196,6 +197,23 @@ class LLMConfig(BaseModel):
             raise ValueError("base_url 必须以 http:// 或 https:// 开头")
         return v
 
+    @field_validator("provider")
+    @classmethod
+    def validate_provider(cls, v: str) -> str:
+        v = (v or "anthropic").strip().lower()
+        aliases = {
+            "anthropic": "anthropic",
+            "claude": "anthropic",
+            "openai": "openai_compatible",
+            "openai_compatible": "openai_compatible",
+            "openai-compatible": "openai_compatible",
+            "kimi": "openai_compatible",
+            "moonshot": "openai_compatible",
+        }
+        if v not in aliases:
+            raise ValueError("provider 必须是 anthropic 或 openai_compatible")
+        return aliases[v]
+
     @field_validator("proxy")
     @classmethod
     def validate_proxy(cls, v: str) -> str:
@@ -209,6 +227,7 @@ async def get_llm_config_api():
     """返回当前 LLM 配置 (脱敏)."""
     config = llm_client.get_llm_config()
     # overlay DB-stored values for fields that env var may override
+    db_provider = await get_config("llm_provider")
     db_base_url = await get_config("llm_base_url")
     db_api_key_header = await get_config("llm_api_key_header")
     db_api_key_prefix = await get_config("llm_api_key_prefix")
@@ -222,6 +241,7 @@ async def get_llm_config_api():
         except Exception:
             pass
     return {
+        "provider": config["provider"],
         "base_url": config["base_url"],
         "has_api_key": config["has_api_key"],
         "api_key_header": config["api_key_header"],
@@ -229,6 +249,7 @@ async def get_llm_config_api():
         "proxy": config["proxy"],
         "model_map": config["model_map"],
         "using_oauth_fallback": config["using_oauth_fallback"],
+        "db_provider": db_provider or "anthropic",
         "db_base_url": db_base_url or "",
         "db_api_key_header": db_api_key_header or "x-api-key",
         "db_api_key_prefix": db_api_key_prefix or "",
@@ -241,24 +262,30 @@ async def get_llm_config_api():
 async def save_llm_config_api(data: LLMConfig):
     """保存 LLM 配置到 DB 并应用."""
     import json
+    await set_config("llm_provider", data.provider)
     await set_config("llm_base_url", data.base_url)
     if data.update_api_key and data.api_key:
         await set_config("llm_api_key", data.api_key)
     await set_config("llm_api_key_header", data.api_key_header)
     await set_config("llm_api_key_prefix", data.api_key_prefix)
     await set_config("llm_proxy", data.proxy)
-    if data.model_map:
-        await set_config("llm_model_map", json.dumps(data.model_map, ensure_ascii=False))
+    model_map = data.model_map
+    if data.provider == "openai_compatible" and not model_map:
+        model_map = {"smart": "kimi-k2.6", "balanced": "kimi-k2.6", "fast": "kimi-k2.6"}
+
+    if model_map:
+        await set_config("llm_model_map", json.dumps(model_map, ensure_ascii=False))
     else:
         await set_config("llm_model_map", "")
 
     llm_client.configure_llm(
+        provider=data.provider,
         base_url=data.base_url,
         api_key=data.api_key if data.update_api_key else "",
         api_key_header=data.api_key_header,
         api_key_prefix=data.api_key_prefix,
         proxy=data.proxy,
-        model_map=data.model_map or None,
+        model_map=model_map or None,
     )
     return {"message": "保存成功"}
 

@@ -4,12 +4,50 @@
 """
 from __future__ import annotations
 import asyncio
+import logging
 import os
+import sys
 import warnings
 from contextlib import asynccontextmanager
 
 # macOS 系统 Python 3.9 用 LibreSSL 2.8.3, urllib3 v2 会嗷嗷叫。无害, 屏蔽
 warnings.filterwarnings("ignore", message=".*OpenSSL.*", module="urllib3")
+
+# App logs go to stdout so launchd captures them in logs/stdout.log.  Include
+# timestamps because the backend is often run unattended as a LaunchAgent.
+logging.basicConfig(
+    level=getattr(logging, os.environ.get("LOG_LEVEL", "INFO").upper(), logging.INFO),
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    stream=sys.stdout,
+    force=True,
+)
+_LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+LOGGING_CONFIG = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {
+        "default": {
+            "format": "%(asctime)s %(levelname)s [%(name)s] %(message)s",
+            "datefmt": "%Y-%m-%d %H:%M:%S",
+        },
+        "access": {
+            "format": "%(asctime)s %(levelname)s [%(name)s] %(message)s",
+            "datefmt": "%Y-%m-%d %H:%M:%S",
+        },
+    },
+    "handlers": {
+        "default": {"class": "logging.StreamHandler", "formatter": "default", "stream": "ext://sys.stdout"},
+        "access": {"class": "logging.StreamHandler", "formatter": "access", "stream": "ext://sys.stdout"},
+    },
+    "root": {"handlers": ["default"], "level": _LOG_LEVEL},
+    "loggers": {
+        "uvicorn": {"handlers": ["default"], "level": _LOG_LEVEL, "propagate": False},
+        "uvicorn.error": {"handlers": ["default"], "level": _LOG_LEVEL, "propagate": False},
+        "uvicorn.access": {"handlers": ["access"], "level": _LOG_LEVEL, "propagate": False},
+    },
+}
+logger = logging.getLogger(__name__)
 
 # 清掉所有代理 env, 避免 akshare / requests 走系统代理被 EM/Sina 拒
 for _k in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy"):
@@ -35,6 +73,7 @@ from api.export_routes import router as export_router
 from api.dca_routes import router as dca_router
 from api.news_routes import router as news_router, news_prewarm_loop
 from api.ask_routes import router as ask_router
+from api.health_routes import router as health_router
 from services.sector_matrix import sector_matrix_prewarm_loop
 from services.coiled_scanner import coiled_prewarm_loop
 from services.portfolio_curve import curve_prewarm_loop
@@ -47,29 +86,40 @@ from services import feishu_notify
 async def lifespan(app: FastAPI):
     await init_db()
     # Restore saved LLM config (多厂商: base_url / key / header / prefix / proxy / model_map)
+    llm_provider = await get_config("llm_provider")
     llm_base_url = await get_config("llm_base_url")
     llm_api_key = await get_config("llm_api_key")
     llm_api_key_header = await get_config("llm_api_key_header")
     llm_api_key_prefix = await get_config("llm_api_key_prefix")
     llm_proxy = await get_config("llm_proxy")
     llm_model_map_raw = await get_config("llm_model_map")
+    llm_extra_body_raw = await get_config("llm_extra_body")
     llm_model_map = None
+    llm_extra_body = None
     if llm_model_map_raw:
         try:
             import json as _json
             llm_model_map = _json.loads(llm_model_map_raw)
         except Exception:
             pass
+    if llm_extra_body_raw:
+        try:
+            import json as _json
+            llm_extra_body = _json.loads(llm_extra_body_raw)
+        except Exception:
+            pass
     # 兼容旧键: 老版本只存了 llm_proxy_url
     if not llm_proxy:
         llm_proxy = await get_config("llm_proxy_url") or ""
     llm_client.configure_llm(
+        provider=llm_provider or "",
         base_url=llm_base_url or "",
         api_key=llm_api_key or "",
         api_key_header=llm_api_key_header or "",
         api_key_prefix=llm_api_key_prefix or "",
         proxy=llm_proxy or "",
         model_map=llm_model_map,
+        extra_body=llm_extra_body,
     )
 
     # 本地代理(OKX/外发统一): env CRYPTO_PROXY > DB network_proxy > 自动探测。
@@ -79,7 +129,7 @@ async def lifespan(app: FastAPI):
     pr = await asyncio.to_thread(proxy_config.resolve_and_apply, stored_proxy)
     if pr.get("proxy"):
         tag = "自动探测" if pr.get("source") == "auto" else "配置"
-        print(f"本地代理({tag}{'·可用' if pr.get('ok') else '·不通'}): {pr['proxy']}")
+        logger.info("本地代理(%s%s): %s", tag, "·可用" if pr.get("ok") else "·不通", pr["proxy"])
         if pr.get("source") == "auto" and pr.get("ok"):
             await set_config("network_proxy", pr["proxy"])   # 探测到的回存, 下次直接用
 
@@ -88,7 +138,7 @@ async def lifespan(app: FastAPI):
     tdx_url = os.environ.get("TDX_BASE_URL") or (await get_config("tdx_base_url")) or getattr(config, "tdx_base_url", "") or ""
     tdx_client.configure(tdx_url)
     if tdx_url:
-        print(f"TDX 数据源已启用: {tdx_url}")
+        logger.info("TDX 数据源已启用: %s", tdx_url)
 
     # Restore saved feishu webhook config + 静音状态
     url = await get_config("feishu_webhook_url")
@@ -98,7 +148,7 @@ async def lifespan(app: FastAPI):
     if muted_val == "1":
         feishu_notify.set_muted(True)
     if url:
-        print(f"飞书推送 {'静音中' if feishu_notify.is_muted() else '已启用'}")
+        logger.info("飞书推送 %s", "静音中" if feishu_notify.is_muted() else "已启用")
     task1 = asyncio.create_task(price_monitor_loop())
     task2 = asyncio.create_task(backup_loop())
     task3 = asyncio.create_task(briefing_loop())
@@ -107,7 +157,7 @@ async def lifespan(app: FastAPI):
     task6 = asyncio.create_task(sector_matrix_prewarm_loop())
     task7 = asyncio.create_task(coiled_prewarm_loop())
     task8 = asyncio.create_task(curve_prewarm_loop())
-    print(f"理财助手已启动: http://localhost:{config.port}")
+    logger.info("理财助手已启动: http://localhost:%s", config.port)
     yield
     task1.cancel()
     task2.cancel()
@@ -138,6 +188,7 @@ app.include_router(dca_router)
 app.include_router(news_router)
 app.include_router(ask_router)
 app.include_router(broker_router)
+app.include_router(health_router)
 app.include_router(ws_router)
 
 
@@ -179,4 +230,5 @@ if __name__ == "__main__":
         host=config.host,
         port=config.port,
         reload=False,
+        log_config=LOGGING_CONFIG,
     )

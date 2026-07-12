@@ -387,7 +387,7 @@ async def _ai_judge(row: dict) -> dict | None:
         # sonnet-5 先输出 thinking 块再给正文, thinking 长度不定; 预算被吃光(text空)时加倍重试一次
         text = ""
         for budget in (2500, 6000):
-            resp = await asyncio.to_thread(call_claude_messages, messages, _AI_SYS, "claude-sonnet-5", budget)
+            resp = await asyncio.to_thread(call_claude_messages, messages, _AI_SYS, "balanced", budget)
             text = "".join(p.get("text", "") for p in resp.get("content", []) if p.get("type") == "text")
             if text.strip():
                 break

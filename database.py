@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS holdings (
     stock_name TEXT NOT NULL DEFAULT '',
     shares INTEGER NOT NULL,
     cost_price REAL NOT NULL,
+    cost_price_override REAL,
     purchase_date TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -436,60 +437,11 @@ async def init_db():
         if "broker" not in cols:
             # 本笔成交的券商 (可选); NULL → 用持仓默认券商。支持同股跨券商, 手续费按各自费率
             await db.execute("ALTER TABLE position_actions ADD COLUMN broker TEXT")
-        if "fx_rate" not in cols:
-            # 港美股成交日汇率(每 1 原币折人民币); NULL → 按当前汇率折算(A 股不用)
-            await db.execute("ALTER TABLE position_actions ADD COLUMN fx_rate REAL")
-        # Migration: kline_cache 加成交额列(老库只有 volume)
-        cursor = await db.execute("PRAGMA table_info(kline_cache)")
-        kc_cols = {row[1] for row in await cursor.fetchall()}
-        if "amount" not in kc_cols:
-            await db.execute("ALTER TABLE kline_cache ADD COLUMN amount REAL DEFAULT 0")
-        # Migration: 自选加「全局手动排序」(老库建表时没有这列)
-        cursor = await db.execute("PRAGMA table_info(watchlist)")
-        wl_cols = {row[1] for row in await cursor.fetchall()}
-        if "sort_order" not in wl_cols:
-            await db.execute("ALTER TABLE watchlist ADD COLUMN sort_order REAL DEFAULT 0")
-            # 老数据按加入时间倒序给初始位次, 保持用户当前看到的顺序不变
-            await db.execute(
-                "UPDATE watchlist SET sort_order = (SELECT COUNT(*) FROM watchlist w2 "
-                "WHERE w2.created_at > watchlist.created_at)")
-        # Migration: 分组从 watchlist.grp/group_order 两列搬到 watchlist_group 关联表(一票多组)。
-        # 搬完必须把老列去掉: 留着就是第二本账, 以后谁读到的都是搬迁那一刻的快照。而删列
-        # 之前得先把上面的 ADD COLUMN 兜底去掉, 否则下次启动又原样加回来。
-        if "grp" in wl_cols:
-            await db.execute(
-                "INSERT OR IGNORE INTO watchlist_group (stock_code, grp, group_order) "
-                "SELECT stock_code, grp, COALESCE(group_order, 0) FROM watchlist "
-                "WHERE COALESCE(grp, '') <> ''")
-            cursor = await db.execute(
-                "SELECT (SELECT COUNT(*) FROM watchlist WHERE COALESCE(grp,'') <> ''), "
-                "(SELECT COUNT(*) FROM watchlist w JOIN watchlist_group g "
-                " ON g.stock_code = w.stock_code AND g.grp = w.grp "
-                " WHERE COALESCE(w.grp,'') <> '')")
-            expect, moved = await cursor.fetchone()
-            if moved >= expect:                      # 逐行核对搬到位了才动老列
-                try:
-                    await db.execute("ALTER TABLE watchlist DROP COLUMN grp")
-                    await db.execute("ALTER TABLE watchlist DROP COLUMN group_order")
-                except Exception:
-                    # SQLite < 3.35 没有 DROP COLUMN: 列留着但没人读。清空值, 否则下次
-                    # 启动又照着老列搬一遍 —— 会把用户后来移出的分组复活。
-                    await db.execute("UPDATE watchlist SET grp = ''")
-        # Migration(一次性): 把「还没归组」的票补进默认组「自选」。
-        # 「自选」是一个真实分组, 不是"没有分组" —— 一只票可以同时在「自选」和「金矿」里。
-        # 只能跑一次: 跑第二遍会把用户后来从「自选」里取消勾选的票又塞回去(他明确只想留
-        # 「金矿」)。所以拿 app_config 一个键当一次性闸门, 而不是"看它有没有分组"。
-        cursor = await db.execute(
-            "SELECT value FROM app_config WHERE key = 'watchlist_default_group_filled'")
-        if not await cursor.fetchone():
-            await db.execute(
-                "INSERT OR IGNORE INTO watchlist_group (stock_code, grp, group_order) "
-                "SELECT w.stock_code, ?, COALESCE(w.sort_order, 0) FROM watchlist w "
-                "WHERE NOT EXISTS (SELECT 1 FROM watchlist_group g WHERE g.stock_code = w.stock_code)",
-                (DEFAULT_WATCH_GROUP,))
-            await db.execute(
-                "INSERT OR IGNORE INTO app_config (key, value) VALUES "
-                "('watchlist_default_group_filled', '1')")
+        cursor = await db.execute("PRAGMA table_info(holdings)")
+        holding_cols = {row[1] for row in await cursor.fetchall()}
+        if "cost_price_override" not in holding_cols:
+            # 用户手动覆盖的券商 App 成本价. NULL = 按流水自动计算.
+            await db.execute("ALTER TABLE holdings ADD COLUMN cost_price_override REAL")
         # Migration: add trade_time to external_asset_actions
         cursor = await db.execute("PRAGMA table_info(external_asset_actions)")
         eaa_cols = {row[1] for row in await cursor.fetchall()}
@@ -699,8 +651,9 @@ async def update_holding(stock_code: str, **kwargs):
     try:
         sets = []
         vals = []
+        nullable = {"cost_price_override"}
         for k, v in kwargs.items():
-            if v is not None:
+            if v is not None or k in nullable:
                 sets.append(f"{k} = ?")
                 vals.append(v)
         if not sets:

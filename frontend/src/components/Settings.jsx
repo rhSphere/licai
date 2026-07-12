@@ -300,13 +300,49 @@ function ProxySection() {
 }
 
 function LLMConfigSection() {
+  const PRESETS = {
+    anthropic: {
+      label: 'Anthropic / Claude', provider: 'anthropic', baseUrl: 'https://api.anthropic.com',
+      header: 'x-api-key', prefix: '', modelMap: { smart: 'claude-opus-4-8', balanced: 'claude-sonnet-5', fast: 'claude-sonnet-5' },
+      extraBody: {},
+      hint: 'Anthropic 官方 Messages API；不填 API Key 时可走 Claude Code OAuth。',
+    },
+    kimi: {
+      label: 'Kimi / Moonshot', provider: 'openai_compatible', baseUrl: 'https://api.moonshot.cn/v1',
+      header: 'Authorization', prefix: 'Bearer', modelMap: { smart: 'kimi-k2.6', balanced: 'kimi-k2.6', fast: 'kimi-k2.6' },
+      extraBody: {},
+      hint: 'Moonshot OpenAI-compatible: https://api.moonshot.cn/v1 + Authorization: Bearer。',
+    },
+    qwen: {
+      label: '通义千问 / DashScope', provider: 'openai_compatible', baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+      header: 'Authorization', prefix: 'Bearer', modelMap: { smart: 'qwen3.7-plus', balanced: 'qwen3.7-plus', fast: 'qwen3.7-plus' },
+      extraBody: { enable_thinking: true },
+      hint: '阿里百炼 DashScope OpenAI-compatible；如使用国际站/业务空间域名，可手动改 Base URL。',
+    },
+    custom: {
+      label: '自定义 OpenAI-compatible', provider: 'openai_compatible', baseUrl: '',
+      header: 'Authorization', prefix: 'Bearer', modelMap: {},
+      extraBody: {},
+      hint: '任意 OpenAI-compatible 服务；Base URL 通常以 /v1 或 /compatible-mode/v1 结尾。',
+    },
+  }
+  const guessPreset = (d) => {
+    const p = d.db_provider || 'anthropic'
+    const u = d.db_base_url || ''
+    if (p === 'anthropic') return 'anthropic'
+    if (u.includes('moonshot.cn')) return 'kimi'
+    if (u.includes('dashscope') || u.includes('aliyuncs.com') || u.includes('maas.aliyuncs.com')) return 'qwen'
+    return 'custom'
+  }
   const [provider, setProvider] = useState('anthropic')
+  const [preset, setPreset] = useState('anthropic')
   const [baseUrl, setBaseUrl] = useState('')
   const [apiKey, setApiKey] = useState('')
   const [apiKeyHeader, setApiKeyHeader] = useState('x-api-key')
   const [apiKeyPrefix, setApiKeyPrefix] = useState('')
   const [proxy, setProxy] = useState('')
   const [modelMap, setModelMap] = useState('')
+  const [extraBody, setExtraBody] = useState('')
   const [status, setStatus] = useState({ text: '', ok: null })
   const [saving, setSaving] = useState(false)
   const [testing, setTesting] = useState(false)
@@ -314,6 +350,7 @@ function LLMConfigSection() {
 
   useEffect(() => {
     api.getLLMConfig().then(d => {
+      setPreset(guessPreset(d))
       setProvider(d.db_provider || 'anthropic')
       setBaseUrl(d.db_base_url || '')
       setDbHasKey(d.has_api_key)
@@ -321,16 +358,36 @@ function LLMConfigSection() {
       setApiKeyPrefix(d.db_api_key_prefix || '')
       setProxy(d.db_proxy || '')
       setModelMap(d.db_model_map && Object.keys(d.db_model_map).length ? JSON.stringify(d.db_model_map, null, 2) : '')
+      setExtraBody(d.db_extra_body && Object.keys(d.db_extra_body).length ? JSON.stringify(d.db_extra_body, null, 2) : '')
     }).catch(() => {})
   }, [])
+
+  const applyPreset = (key) => {
+    const p = PRESETS[key] || PRESETS.custom
+    setPreset(key)
+    setProvider(p.provider)
+    setBaseUrl(p.baseUrl)
+    setApiKeyHeader(p.header)
+    setApiKeyPrefix(p.prefix)
+    setModelMap(Object.keys(p.modelMap).length ? JSON.stringify(p.modelMap, null, 2) : '')
+    setExtraBody(Object.keys(p.extraBody || {}).length ? JSON.stringify(p.extraBody, null, 2) : '')
+  }
 
   const handleSave = async () => {
     setSaving(true)
     try {
       let modelMapObj = {}
+      let extraBodyObj = {}
       if (modelMap.trim()) {
         try { modelMapObj = JSON.parse(modelMap) } catch {
           setStatus({ text: '模型映射 JSON 格式错误', ok: false })
+          setSaving(false)
+          return
+        }
+      }
+      if (extraBody.trim()) {
+        try { extraBodyObj = JSON.parse(extraBody) } catch {
+          setStatus({ text: '扩展请求参数 JSON 格式错误', ok: false })
           setSaving(false)
           return
         }
@@ -343,6 +400,7 @@ function LLMConfigSection() {
         api_key_prefix: apiKeyPrefix.trim(),
         proxy: proxy.trim(),
         model_map: modelMapObj,
+        extra_body: extraBodyObj,
         update_api_key: apiKey.trim().length > 0,
       })
       setStatus({ text: '已保存', ok: true })
@@ -380,7 +438,19 @@ function LLMConfigSection() {
 
       <div className="grid grid-cols-1 gap-2 mb-2">
         <div>
-          <label className="text-[11px] text-text-muted">Provider</label>
+          <label className="text-[11px] text-text-muted">厂商预设</label>
+          <select
+            className="w-full bg-bg border border-border rounded px-3 py-1.5 text-[12px] text-text outline-none focus:border-accent"
+            value={preset}
+            onChange={e => applyPreset(e.target.value)}
+          >
+            {Object.entries(PRESETS).map(([k, v]) => <option key={k} value={k}>{v.label}</option>)}
+          </select>
+          <p className="text-[10px] text-text-muted mt-0.5">{(PRESETS[preset] || PRESETS.custom).hint}</p>
+        </div>
+
+        <div>
+          <label className="text-[11px] text-text-muted">Provider 协议</label>
           <select
             className="w-full bg-bg border border-border rounded px-3 py-1.5 text-[12px] text-text outline-none focus:border-accent"
             value={provider}
@@ -400,10 +470,10 @@ function LLMConfigSection() {
             }}
           >
             <option value="anthropic">Anthropic / Claude</option>
-            <option value="openai_compatible">OpenAI-compatible / Kimi</option>
+            <option value="openai_compatible">OpenAI-compatible</option>
           </select>
           <p className="text-[10px] text-text-muted mt-0.5">
-            Kimi 使用 OpenAI-compatible: https://api.moonshot.cn/v1 + Authorization: Bearer。
+            预设只负责自动填默认值；下面 Base URL / 模型映射 / Header 都可以继续手动改。
           </p>
         </div>
 
@@ -411,7 +481,7 @@ function LLMConfigSection() {
           <label className="text-[11px] text-text-muted">API Base URL</label>
           <input
             className="w-full bg-bg border border-border rounded px-3 py-1.5 text-[12px] text-text font-mono outline-none focus:border-accent"
-            placeholder={provider === 'openai_compatible' ? 'https://api.moonshot.cn/v1' : 'https://api.anthropic.com'}
+            placeholder={provider === 'openai_compatible' ? 'https://dashscope.aliyuncs.com/compatible-mode/v1' : 'https://api.anthropic.com'}
             value={baseUrl} onChange={e => setBaseUrl(e.target.value)}
           />
         </div>
@@ -457,10 +527,20 @@ function LLMConfigSection() {
           <label className="text-[11px] text-text-muted">模型别名映射（JSON，可选）</label>
           <textarea rows={3}
             className="w-full bg-bg border border-border rounded px-3 py-1.5 text-[12px] text-text font-mono outline-none focus:border-accent resize-none"
-            placeholder={provider === 'openai_compatible' ? '{"smart":"kimi-k2.6","balanced":"kimi-k2.6","fast":"kimi-k2.6"}' : '{"smart":"claude-opus-4-8","balanced":"claude-sonnet-4-6","fast":"claude-sonnet-4-6"}'}
+            placeholder={provider === 'openai_compatible' ? '{"smart":"qwen-max","balanced":"qwen-plus","fast":"qwen-turbo"}' : '{"smart":"claude-opus-4-8","balanced":"claude-sonnet-5","fast":"claude-sonnet-5"}'}
             value={modelMap} onChange={e => setModelMap(e.target.value)}
           />
           <p className="text-[10px] text-text-muted mt-0.5">逻辑名: smart / balanced / fast → 实际模型名</p>
+        </div>
+
+        <div>
+          <label className="text-[11px] text-text-muted">OpenAI-compatible 扩展请求参数（JSON，可选）</label>
+          <textarea rows={2}
+            className="w-full bg-bg border border-border rounded px-3 py-1.5 text-[12px] text-text font-mono outline-none focus:border-accent resize-none"
+            placeholder='{"enable_thinking": true}'
+            value={extraBody} onChange={e => setExtraBody(e.target.value)}
+          />
+          <p className="text-[10px] text-text-muted mt-0.5">千问深度思考示例: {`{"enable_thinking": true}`}；自定义服务不需要可留空。</p>
         </div>
       </div>
 

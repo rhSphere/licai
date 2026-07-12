@@ -38,52 +38,7 @@ import PortfolioCorrelation from './components/PortfolioCorrelation'
 // 我的·配置建议
 import AllocationAdvisor from './components/AllocationAdvisor'
 import AShareSectorGap from './components/AShareSectorGap'
-// 我的·复盘
-import EntryReview from './components/EntryReview'
-
-// 合法 view key。setView 与 hash 初始化共用 —— 只在初始化校验的话,
-// 运行时传入非法 key(历史上有已删视图的残留调用)会让内容区渲染成空白。
-// 直接从侧栏 NAV 派生, 不再手抄一份: 两份列表漂移时两个方向都是静默失败
-// (NAV 多一个 → 点了跳回持仓; 这边多一个 → 一个谁也点不到的页), 都不报错。
-const VIEWS = NAV.flatMap(s => s.items.map(i => i.key))
-const normalizeView = (v) => (VIEWS.includes(v) ? v : 'portfolio')
-
-// hash → view。初始化和 hashchange(前进/后退键) 共用这一份, 两处各写一份必然漂移。
-// 支持 #view?k=v 形式的 deep-link(子参数由各组件自行读取)。
-function resolveHash() {
-  const raw = (window.location.hash || '').slice(1)
-  const h = raw.split('?')[0]
-  // 退役 deep-link #rankings?t=pools: 股池不再是榜单的一个页签, 已经是【市场】下的
-  // 独立页。这是"整页搬走"而不是"页签改名", 所以在这里改派到那一页 —— 落回榜单
-  // 随便挑一个页签(会静默落到「涨幅」)给的是另一份数据, 等于骗人。
-  if (h === 'rankings' && new URLSearchParams(raw.split('?')[1] || '').get('t') === 'pools') {
-    // 改写 hash 会再触发一次 hashchange, 那一次 h 已是 pools、不再命中这个分支, 会收敛
-    try { window.location.hash = 'pools' } catch { /* 忽略, 视图已经切对了 */ }
-    // 走 normalizeView 而不是直接 return: 万一哪天 'pools' 从 NAV 里下掉,
-    // 这里跟着回落持仓页, 而不是把一个不存在的 key 塞进 state 渲染成空白。
-    return normalizeView('pools')
-  }
-  return normalizeView(h)
-}
-
-// 与 BenchmarkCompare/SectorRadar 同款的 section 外壳 + 标题带。给"自身没有卡壳"的
-// 组件用: 那类组件原先住在别的卡内部(根节点只是 mb-3), 单独上页会浮在背景上。
-// [&>div]:mb-0 抹掉组件自带的 mb-3, 否则会和页面 space-y-3 叠成双份间距。
-function CardShell({ title, sub, children }) {
-  return (
-    <section className="rounded-xl border border-border bg-surface/60 overflow-hidden"
-      style={{ animation: 'fade-up 0.4s ease-out' }}>
-      <div className="px-3 md:px-5 py-3 border-b border-border flex items-baseline gap-2 flex-wrap"
-        style={{ background: 'linear-gradient(180deg, var(--color-surface-2), var(--color-surface))' }}>
-        <h3 className="text-[13px] font-semibold text-text-bright m-0">{title}</h3>
-        <span className="text-[11px] text-text-dim">{sub}</span>
-      </div>
-      <div className="px-3 md:px-5 py-3 [&>div]:mb-0">
-        {children}
-      </div>
-    </section>
-  )
-}
+import BulkTradeImport from './components/BulkTradeImport'
 
 export default function App() {
   const [holdings, setHoldings] = useState([])
@@ -315,17 +270,18 @@ export default function App() {
           {/* 视图内容: 唯一滚动区 — 侧边栏/顶栏/仪表盘全部固定 */}
           <div className="flex-1 min-h-0 overflow-y-auto">
 
-          {PAGES[view]
-              ? PAGES[view]()
-              /* 侧栏点得到、这里却没有对应页 —— 原来是一片空白内容区, 什么都不说。
-                 这个坑真踩过一次(关设置时 setView('dashboard'), 而 dashboard 不是任何一页),
-                 所以留一句会说话的兜底, 顺带在开发期抛(见文件末尾的自检)。 */
-              : (
-                <div className={`${PAD} text-[13px] text-text-dim`}>
-                  这一页还没接上内容(view=<code className="text-text">{view}</code>)。
-                </div>
-              )}
-          </div>
+          {view === 'portfolio' && (
+            <div className={`${PAD} space-y-3 md:space-y-4`}>
+              <UnifiedPortfolio
+                holdings={holdings}
+                onEdit={setEditTarget}
+                onHistory={setHistoryTarget}
+                onAdd={handleHoldingChange}
+                dataVersion={dataVersion}
+              />
+              <DCAManager />
+              <BulkTradeImport onDone={handleHoldingChange} />
+            </div>
           )}
 
           {view === 'unwind' && (

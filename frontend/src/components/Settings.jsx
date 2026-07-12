@@ -319,6 +319,12 @@ function LLMConfigSection() {
       extraBody: { enable_thinking: true },
       hint: '阿里百炼 DashScope OpenAI-compatible；如使用国际站/业务空间域名，可手动改 Base URL。',
     },
+    minimax: {
+      label: 'MiniMax', provider: 'openai_compatible', baseUrl: 'https://api.minimaxi.com/v1',
+      header: 'Authorization', prefix: 'Bearer', modelMap: { smart: 'MiniMax-M3', balanced: 'MiniMax-M3', fast: 'MiniMax-M3' },
+      extraBody: { thinking: { type: 'adaptive' } },
+      hint: 'MiniMax OpenAI-compatible: https://api.minimaxi.com/v1 + Authorization: Bearer；按官方示例使用 thinking.type=adaptive。',
+    },
     custom: {
       label: '自定义 OpenAI-compatible', provider: 'openai_compatible', baseUrl: '',
       header: 'Authorization', prefix: 'Bearer', modelMap: {},
@@ -332,6 +338,7 @@ function LLMConfigSection() {
     if (p === 'anthropic') return 'anthropic'
     if (u.includes('moonshot.cn')) return 'kimi'
     if (u.includes('dashscope') || u.includes('aliyuncs.com') || u.includes('maas.aliyuncs.com')) return 'qwen'
+    if (u.includes('minimax.io') || u.includes('minimaxi.com')) return 'minimax'
     return 'custom'
   }
   const [provider, setProvider] = useState('anthropic')

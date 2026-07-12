@@ -74,3 +74,14 @@ async def refresh_briefings():
         "count": len(results),
         "briefings": results,
     }
+
+
+@router.post("/refresh/{stock_code}")
+async def refresh_one_briefing(stock_code: str):
+    """Regenerate briefing for a single holding/ETF to avoid batch LLM limits."""
+    from services.morning_briefing import generate_one_briefing
+    result = await generate_one_briefing(stock_code)
+    return {
+        "date": _today_cst(),
+        "briefing": result,
+    }

@@ -330,6 +330,17 @@ async def trade_review():
         await db.close()
 
     holdings_map = {h["stock_code"]: h for h in await get_all_holdings()}
+    def _fx_for_code(code: str, quote: dict | None = None) -> tuple[str, float]:
+        market = split_stock_code(code)[0]
+        currency = (quote or {}).get("currency") or ("HKD" if market == "HK" else "USD" if market == "US" else "CNY")
+        fx = (quote or {}).get("fx_rate")
+        if currency != "CNY" and not fx:
+            try:
+                fx = get_fx_info(currency).get("rate")
+            except Exception:
+                fx = 1.0
+        return currency, float(fx or 1.0)
+
     stats = []
     for code in codes:
         actions = await get_position_actions(code, limit=500)
@@ -345,11 +356,22 @@ async def trade_review():
                 name = await get_stock_name(code) or code
             except Exception:
                 name = code
+        currency, fx_rate = _fx_for_code(code)
+        realized_native = float(state.get("realized_pnl") or 0)
+        auto_cost_price = float(state.get("cost_price") or 0)
+        hrow = holdings_map.get(code) or {}
+        display_cost_price = float(hrow.get("cost_price_override") if hrow.get("cost_price_override") is not None else auto_cost_price)
         stats.append({
             "code": code, "name": name,
-            "realized": round(float(state.get("realized_pnl") or 0), 2),
+            # 所有复盘汇总统一用 CNY；price/cost_price 仍保留原币种方便展示/对照。
+            "realized": round(realized_native * fx_rate, 2),
+            "realized_native": round(realized_native, 2),
+            "currency": currency,
+            "fx_rate": fx_rate,
             "shares": float(state.get("shares") or 0),
-            "cost_price": float(state.get("cost_price") or 0),
+            "cost_price": display_cost_price,
+            "auto_cost_price": auto_cost_price,
+            "cost_price_override": hrow.get("cost_price_override"),
             "hold_days": int(state.get("weighted_days") or 0),
             "n_buy": n_buy, "n_sell": n_sell,
         })
@@ -360,9 +382,13 @@ async def trade_review():
     for s in stats:
         floating = 0.0
         if s["shares"] > 0:
-            price = (quotes.get(s["code"]) or {}).get("price") or 0
+            q = quotes.get(s["code"]) or {}
+            price = q.get("price") or 0
             if price:
-                floating = (price - s["cost_price"]) * s["shares"]
+                _currency, fx_rate = _fx_for_code(s["code"], q)
+                s["fx_rate"] = fx_rate
+                s["currency"] = _currency
+                floating = (price - s["cost_price"]) * s["shares"] * fx_rate
         s["floating"] = round(floating, 2)
         s["total_pnl"] = round(s["realized"] + floating, 2)
 
@@ -565,6 +591,12 @@ def _parse_llm_json(raw):
         txt = re.sub(r"^```(json)?", "", txt).strip()
         if txt.endswith("```"):
             txt = txt[:-3].strip()
+    # Some OpenAI-compatible models wrap JSON in prose/markdown; pull first object.
+    m_obj = re.search(r"\{.*\}", txt, re.DOTALL)
+    if m_obj:
+        txt = m_obj.group(0)
+    txt = txt.replace("“", '"').replace("”", '"')
+    txt = re.sub(r",\s*([}\]])", r"\1", txt)
     try:
         return json.loads(txt)
     except Exception:
@@ -581,6 +613,39 @@ def _parse_llm_json(raw):
     if m:
         out["summary"] = m.group(1)
     return out
+
+
+def _repair_review_prompt(raw: str) -> str:
+    return (
+        "把下面 AI 复盘内容修复为严格 JSON 对象。只输出 JSON, 不要 markdown, 不要解释。"
+        "字段固定为: summary(string), good(string[]), discipline(object[]), "
+        "binchuan(object[]), market_fit(string), narrative(string)。"
+        "discipline 对象字段: problem, evidence, why。"
+        "binchuan 对象字段: principle, verdict, detail。\n\n"
+        f"原始内容:\n{(raw or '')[:5000]}"
+    )
+
+
+async def _call_review_llm(llm_client, user_prompt: str, system_prompt: str, max_tokens: int) -> tuple[dict, str]:
+    """Call review LLM with JSON mode and one repair attempt."""
+    import asyncio
+    raw = await asyncio.to_thread(
+        llm_client.call_claude, user_prompt, system_prompt, "smart", max_tokens, "json_object",
+    )
+    parsed = _parse_llm_json(raw)
+    if not _looks_placeholder_review(parsed):
+        parsed["_ai_source"] = "ai"
+        return parsed, raw
+    # Retry once as a JSON-repair task; useful for qwen/kimi when they echo schema.
+    repaired = await asyncio.to_thread(
+        llm_client.call_claude,
+        _repair_review_prompt(raw),
+        "你是 JSON 修复器。只输出严格 JSON。", "smart", 1200, "json_object",
+    )
+    parsed2 = _parse_llm_json(repaired)
+    if not _looks_placeholder_review(parsed2):
+        parsed2["_ai_source"] = "ai_repaired"
+    return parsed2, raw
 
 
 def _looks_placeholder_review(result: dict) -> bool:
@@ -646,7 +711,8 @@ def _local_period_review(*, period: str, label: str, ptrades: list, nb: int, ns:
         "n_sell": ns,
         "n_trades": len(ptrades),
         "generated_at": time.time(),
-        "fallback": True,
+            "source": "local_fallback",
+            "fallback": True,
         "error": error,
     }
 
@@ -693,6 +759,7 @@ def _local_all_review(*, review: dict, journal: dict, data_block: str, error: st
             "n_stocks": o.get("n_stocks", 0),
         },
         "generated_at": time.time(),
+        "source": "local_fallback",
         "fallback": True,
         "error": error,
     }
@@ -814,13 +881,12 @@ async def trade_review_ai(period: str = "all", force: int = 0):
                               "(如市场奖励赛道趋势他却追小盘妖股, 或他买的正好在今日主线上), 写进 market_fit 字段; 这是客观对照不是操作建议。")
         user_prompt = f"复盘我{label}的交易:\n\n{data_block}"
         try:
-            raw = await asyncio.to_thread(llm_client.call_claude, user_prompt, system_prompt, "smart", 1800)
+            parsed, raw = await _call_review_llm(llm_client, user_prompt, system_prompt, 1800)
         except Exception as e:
             result = _local_period_review(period=period, label=label, ptrades=ptrades, nb=nb, ns=ns,
                                           market_fit="", error=str(e))
             _ai_review_cache[ck] = (result, time.time())
             return result
-        parsed = _parse_llm_json(raw)
         if _looks_placeholder_review(parsed):
             result = _local_period_review(period=period, label=label, ptrades=ptrades, nb=nb, ns=ns,
                                           market_fit=parsed.get("market_fit", "") if isinstance(parsed, dict) else "",
@@ -836,6 +902,7 @@ async def trade_review_ai(period: str = "all", force: int = 0):
             "market_fit": parsed.get("market_fit", "") if isinstance(parsed.get("market_fit"), str) else "",
             "narrative": parsed.get("narrative", ""),
             "n_buy": nb, "n_sell": ns, "n_trades": len(ptrades),
+            "source": parsed.get("_ai_source", "ai"),
             "generated_at": time.time(),
         }
         _ai_review_cache[ck] = (result, time.time())
@@ -1074,13 +1141,11 @@ async def trade_review_ai(period: str = "all", force: int = 0):
     user_prompt = f"以下是我的真实交易数据(已分'仍持有'和'已清仓'), 平衡复盘我的交易纪律, 别把我已经割掉的票当成还在死扛:\n\n{data_block}"
 
     try:
-        raw = await asyncio.to_thread(llm_client.call_claude, user_prompt, system_prompt, "smart", 4096)
+        parsed, raw = await _call_review_llm(llm_client, user_prompt, system_prompt, 4096)
     except Exception as e:
         result = _local_all_review(review=review, journal=journal, data_block=data_block, error=str(e))
         _ai_review_cache[ck] = (result, time.time())
         return result
-
-    parsed = _parse_llm_json(raw)
     if _looks_placeholder_review(parsed):
         result = _local_all_review(review=review, journal=journal, data_block=data_block,
                                   error="AI 复盘输出为空或格式异常，已用本地复盘")
@@ -1094,6 +1159,7 @@ async def trade_review_ai(period: str = "all", force: int = 0):
         "discipline": parsed.get("discipline", []) if isinstance(parsed.get("discipline"), list) else [],
         "binchuan": parsed.get("binchuan", []) if isinstance(parsed.get("binchuan"), list) else [],
         "narrative": parsed.get("narrative", ""),
+        "source": parsed.get("_ai_source", "ai"),
         "stats": {
             "win_rate": o["win_rate"], "buy_hit_rate": journal["buy_hit_rate"],
             "sell_hit_rate": journal["sell_hit_rate"], "avg_hold_days": o["avg_hold_days"],

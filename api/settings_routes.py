@@ -213,6 +213,8 @@ class LLMConfig(BaseModel):
             "qwen": "openai_compatible",
             "tongyi": "openai_compatible",
             "dashscope": "openai_compatible",
+            "minimax": "openai_compatible",
+            "minimaxi": "openai_compatible",
         }
         if v not in aliases:
             raise ValueError("provider 必须是 anthropic 或 openai_compatible")

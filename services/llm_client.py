@@ -56,6 +56,8 @@ _PROVIDER_ALIASES = {
     "qwen": "openai_compatible",
     "tongyi": "openai_compatible",
     "dashscope": "openai_compatible",
+    "minimax": "openai_compatible",
+    "minimaxi": "openai_compatible",
 }
 
 # ── 运行时可变状态 ─────────────────────────────────────
@@ -196,6 +198,22 @@ def resolve_model(model: str) -> str:
 def get_model_map() -> dict[str, str]:
     """Return a copy of the current model alias map."""
     return dict(_model_map)
+
+
+def _apply_openai_extra_body(payload: dict) -> dict:
+    """Merge provider-specific OpenAI-compatible extension fields.
+
+    MiniMax's OpenAI-compatible endpoint documents max_completion_tokens and
+    thinking instead of max_tokens/reasoning_split, so adapt when the MiniMax
+    base URL or thinking extension is configured.
+    """
+    if _extra_body:
+        payload.update(_extra_body)
+    base = (_base_url or "").lower()
+    if ("minimax" in base or "minimaxi" in base or "thinking" in payload):
+        if "max_tokens" in payload and "max_completion_tokens" not in payload:
+            payload["max_completion_tokens"] = payload.pop("max_tokens")
+    return payload
 
 
 # ── 公共配置 API ───────────────────────────────────────
@@ -684,6 +702,68 @@ def _post_with_retry(headers: dict, payload: dict) -> requests.Response:
     raise RuntimeError("LLM call retry exhausted with no exception")
 
 
+def post_once_for_briefing(headers: dict, payload: dict) -> requests.Response:
+    """Single LLM POST for low-priority briefing jobs.
+
+    Briefing may fan out over many holdings. Retrying 429 for every card makes
+    provider throttling worse, so callers can use this no-retry path and fall
+    back to local summaries immediately.
+    """
+    api_url = _build_api_url()
+    _throttle_before_request()
+    try:
+        return _llm_session.post(api_url, headers=headers, json=payload, timeout=_HTTP_TIMEOUT)
+    except requests.exceptions.ProxyError:
+        _throttle_before_request()
+        return _direct_session.post(api_url, headers=headers, json=payload, timeout=_HTTP_TIMEOUT)
+
+
+def call_claude_once(
+    user_prompt: str,
+    system: str | None = None,
+    model: str = "claude-sonnet-5",
+    max_tokens: int = 2048,
+    response_format: str | None = None,
+) -> str:
+    """Single-attempt variant for batch/briefing jobs; no retry on 429."""
+    model = resolve_model(model)
+    token, is_oauth = _resolve_auth()
+    headers = _build_headers(token, is_oauth)
+    system_blocks = _build_system(system, is_oauth)
+    if _is_openai_compatible():
+        payload = {
+            "model": model,
+            "max_tokens": max_tokens,
+            "messages": _anthropic_messages_to_openai(
+                [{"role": "user", "content": user_prompt}], system or ""
+            ),
+        }
+        _apply_openai_extra_body(payload)
+        if response_format == "json_object":
+            payload["response_format"] = {"type": "json_object"}
+    else:
+        payload = {
+            "model": model,
+            "max_tokens": max_tokens,
+            "messages": [{"role": "user", "content": user_prompt}],
+            "system": system_blocks,
+        }
+    resp = post_once_for_briefing(headers, payload)
+    resp = _retry_on_oauth_401(resp, token, is_oauth, system, headers, payload)
+    if not resp.ok:
+        raise RuntimeError(f"LLM API error {resp.status_code}: {_safe_error_body(resp)}")
+    data = resp.json()
+    if _is_openai_compatible():
+        choices = data.get("choices") or []
+        msg = (choices[0].get("message") if choices else {}) or {}
+        text = _openai_content_to_text(msg.get("content"))
+        if not text and isinstance(msg.get("reasoning_content"), str):
+            text = msg.get("reasoning_content") or ""
+        return text
+    parts = data.get("content", [])
+    return "".join(p.get("text", "") for p in parts if p.get("type") == "text")
+
+
 def _safe_error_body(resp) -> str:
     """Return a truncated, key-sanitized version of the response body for error messages.
 
@@ -767,8 +847,7 @@ def call_claude(
                 [{"role": "user", "content": user_prompt}], system or ""
             ),
         }
-        if _extra_body:
-            payload.update(_extra_body)
+        _apply_openai_extra_body(payload)
         if response_format == "json_object":
             payload["response_format"] = {"type": "json_object"}
     else:
@@ -831,8 +910,7 @@ def call_claude_messages(
             "max_tokens": max_tokens,
             "messages": _anthropic_messages_to_openai(messages, system or ""),
         }
-        if _extra_body:
-            payload.update(_extra_body)
+        _apply_openai_extra_body(payload)
         ot = _anthropic_tools_to_openai(tools)
         if ot:
             payload["tools"] = ot
@@ -880,8 +958,7 @@ def test_connection() -> dict:
                     [{"role": "user", "content": "Say ok"}], "Reply with just 'ok'."
                 ),
             }
-            if _extra_body:
-                payload.update(_extra_body)
+            _apply_openai_extra_body(payload)
         else:
             payload = {
                 "model": model,

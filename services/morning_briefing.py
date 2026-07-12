@@ -377,7 +377,7 @@ async def generate_briefing_for_stock(stock_code: str, stock_name: str,
                                       sector_hint: str = "",
                                       skip_llm: bool = False) -> dict:
     """Build briefing for one stock/场内ETF. sector_hint: ETF 传主题词(半导体设备/通信…)当行业。"""
-    from services.llm_client import call_claude
+    from services.llm_client import call_claude_once
     inputs = await _briefing_inputs(
         stock_code=stock_code, stock_name=stock_name, current_price=current_price,
         cost_price=cost_price, shares=shares, sector_hint=sector_hint,
@@ -390,7 +390,7 @@ async def generate_briefing_for_stock(stock_code: str, stock_name: str,
         )
 
     try:
-        parsed = await _call_llm_briefing(call_claude, inputs["user_prompt"])
+        parsed = await _call_llm_briefing(call_claude_once, inputs["user_prompt"])
     except Exception as e:
         reason = "LLM 限流/额度不足, 已用本地摘要" if _is_llm_rate_limited(e) else "AI 摘要暂不可用, 已用本地摘要"
         payload = _briefing_payload_from_fallback(
@@ -416,6 +416,63 @@ async def generate_briefing_for_stock(stock_code: str, stock_name: str,
         "kline_stats": inputs.get("kline_stats") or {},
         "health_level": (inputs.get("health") or {}).get("level"),
     }
+
+
+async def generate_one_briefing(stock_code: str) -> dict:
+    """Generate and persist briefing for a single current holding/ETF."""
+    from database import get_all_holdings, save_briefing, list_external_assets, list_external_actions
+    from services.market_data import get_realtime_quotes, normalize_stock_code
+    from services.external_assets import _is_onchain_etf, fund_theme_word
+    from services.external_ledger import compute_external_state
+
+    code = normalize_stock_code(stock_code)
+    target = None
+    for h in await get_all_holdings():
+        if normalize_stock_code(h["stock_code"]) == code and (h.get("shares") or 0) > 0:
+            target = {
+                "kind": "stock",
+                "code": code,
+                "name": h.get("stock_name") or code,
+                "shares": int(h.get("shares") or 0),
+                "cost_price": float(h.get("cost_price") or 0),
+                "theme": "",
+            }
+            break
+
+    if target is None:
+        for x in await list_external_assets():
+            xcode = normalize_stock_code(str(x.get("code") or ""))
+            if x.get("asset_type") != "FUND" or not _is_onchain_etf(xcode) or xcode != code:
+                continue
+            st = compute_external_state(await list_external_actions(x["id"]), "FUND")
+            sh = float(st.get("shares") or 0)
+            if sh <= 0:
+                continue
+            target = {
+                "kind": "etf",
+                "code": code,
+                "name": x.get("name") or code,
+                "shares": int(sh),
+                "cost_price": (float(st.get("diluted_cost") or 0) / sh) if sh else 0,
+                "theme": fund_theme_word(x.get("name") or ""),
+            }
+            break
+
+    if target is None:
+        raise ValueError(f"未找到当前持有标的: {stock_code}")
+
+    q = (await get_realtime_quotes([code])).get(code) or {}
+    cur = q.get("price") or target["cost_price"]
+    briefing = await generate_briefing_for_stock(
+        code, target["name"], cost_price=target["cost_price"],
+        shares=target["shares"], current_price=cur, sector_hint=target.get("theme") or "",
+    )
+    today = (datetime.now(timezone.utc) + timedelta(hours=8)).strftime("%Y-%m-%d")
+    briefing["briefing_date"] = today
+    if target["kind"] == "etf":
+        briefing["asset_class"] = "etf"
+    await save_briefing(code, today, json.dumps(briefing, ensure_ascii=False))
+    return briefing
 
 
 async def generate_all_briefings() -> list[dict]:
@@ -449,49 +506,59 @@ async def generate_all_briefings() -> list[dict]:
     quotes = await get_realtime_quotes(codes)
 
     today = (datetime.now(timezone.utc) + timedelta(hours=8)).strftime("%Y-%m-%d")
-    results: list[dict] = []
-    # Run sequentially to be polite to both the akshare news endpoint and LLM
-    # provider org-level rate limits. Kimi/Moonshot may return 429 when many
-    # cards are generated back-to-back; keep a small configurable gap.
-    llm_gap = max(0.0, float(os.environ.get("LLM_BRIEFING_DELAY", "1.2") or 0))
-    skip_llm_rest = False
-    for idx, h in enumerate(holdings):
-        if idx > 0 and llm_gap > 0 and not skip_llm_rest:
-            await asyncio.sleep(llm_gap)
+    # MiniMax token plan can handle several parallel requests. Keep this
+    # configurable for Kimi/Qwen users. max_llm controls how many cards call LLM;
+    # concurrency controls how many run in parallel.
+    max_llm = max(0, int(os.environ.get("LLM_BRIEFING_MAX_LLM", "5") or 0))
+    concurrency = max(1, int(os.environ.get("LLM_BRIEFING_CONCURRENCY", "5") or 1))
+    llm_gap = max(0.0, float(os.environ.get("LLM_BRIEFING_DELAY", "0") or 0))
+    sem = asyncio.Semaphore(concurrency)
+    rate_limited = False
+
+    items = []
+    for h in holdings:
         code = h["stock_code"]
         q = quotes.get(code) or {}
-        cur = q.get("price") or 0
-        if cur <= 0:
-            cur = h.get("cost_price", 0)
-        try:
-            briefing = await generate_briefing_for_stock(
-                code, h.get("stock_name", "") or q.get("stock_name", ""),
-                cost_price=h["cost_price"], shares=h["shares"],
-                current_price=cur, skip_llm=skip_llm_rest,
-            )
-            if briefing.get("llm_rate_limited"):
-                skip_llm_rest = True
-            briefing["briefing_date"] = today
-            await save_briefing(code, today, json.dumps(briefing, ensure_ascii=False))
-            results.append(briefing)
-        except Exception as e:
-            print(f"[briefing] {code} failed: {e}")
+        cur = q.get("price") or h.get("cost_price", 0)
+        items.append({
+            "kind": "stock", "code": code,
+            "name": h.get("stock_name", "") or q.get("stock_name", ""),
+            "cost_price": h["cost_price"], "shares": h["shares"],
+            "current_price": cur, "theme": "",
+        })
     for e in etfs:
         code = e["code"]
         q = quotes.get(code) or {}
-        cur = q.get("price") or 0
-        if cur <= 0:
-            cur = e["cost_price"]
-        try:
-            briefing = await generate_briefing_for_stock(
-                code, e["name"], cost_price=e["cost_price"], shares=int(e["shares"]),
-                current_price=cur, sector_hint=e["theme"], skip_llm=skip_llm_rest)
-            if briefing.get("llm_rate_limited"):
-                skip_llm_rest = True
-            briefing["briefing_date"] = today
-            briefing["asset_class"] = "etf"
-            await save_briefing(code, today, json.dumps(briefing, ensure_ascii=False))
-            results.append(briefing)
-        except Exception as ex:
-            print(f"[briefing] etf {code} failed: {ex}")
-    return results
+        cur = q.get("price") or e["cost_price"]
+        items.append({
+            "kind": "etf", "code": code, "name": e["name"],
+            "cost_price": e["cost_price"], "shares": int(e["shares"]),
+            "current_price": cur, "theme": e["theme"],
+        })
+
+    async def _one(idx: int, item: dict) -> dict | None:
+        nonlocal rate_limited
+        # After max_llm or any rate limit, remaining cards use local summaries.
+        use_llm = (idx < max_llm) and not rate_limited
+        if llm_gap > 0 and use_llm and idx > 0:
+            await asyncio.sleep(llm_gap * min(idx, concurrency))
+        async with sem:
+            try:
+                briefing = await generate_briefing_for_stock(
+                    item["code"], item["name"], cost_price=item["cost_price"],
+                    shares=item["shares"], current_price=item["current_price"],
+                    sector_hint=item.get("theme") or "", skip_llm=not use_llm,
+                )
+                if briefing.get("llm_rate_limited"):
+                    rate_limited = True
+                briefing["briefing_date"] = today
+                if item["kind"] == "etf":
+                    briefing["asset_class"] = "etf"
+                await save_briefing(item["code"], today, json.dumps(briefing, ensure_ascii=False))
+                return briefing
+            except Exception as ex:
+                print(f"[briefing] {item.get('kind')} {item.get('code')} failed: {ex}")
+                return None
+
+    results = await asyncio.gather(*(_one(i, item) for i, item in enumerate(items)))
+    return [r for r in results if r]

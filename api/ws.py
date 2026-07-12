@@ -152,15 +152,24 @@ async def briefing_loop():
                     results = await generate_all_briefings()
                     _briefing_done_date = today
                     logger.info("morning briefings done: %d saved", len(results))
-                    # Push a one-line summary to feishu (signal 模型: 客观信息倾向, 非操作建议)
+                    # Push summary + key points to Feishu (signal 模型: 客观信息倾向, 非操作建议)
                     if feishu_notify.is_enabled() and results:
                         lines = [f"📋 {today} 早盘简报"]
                         for b in results:
                             sig = b.get("signal", "中性")
                             icon = {"偏暖": "🔥", "中性": "•", "偏冷": "❄", "警惕": "⚠"}.get(sig, "•")
-                            lines.append(
-                                f"【{b.get('stock_name')}】{icon} {sig} — {b.get('summary', '')}"
-                            )
+                            name = b.get("stock_name") or b.get("stock_code") or "--"
+                            code = b.get("stock_code") or ""
+                            summary = b.get("summary") or ""
+                            suffix = " · 本地摘要" if b.get("llm_skipped") else ""
+                            lines.append(f"\n【{name}{(' ' + code) if code else ''}】{icon} {sig}{suffix}")
+                            if summary:
+                                lines.append(f"- 摘要: {summary}")
+                            if b.get("risk"):
+                                lines.append(f"- 风险: {b.get('risk')}")
+                            pts = [str(x).strip() for x in (b.get("points") or []) if str(x).strip()]
+                            for p in pts[:3]:
+                                lines.append(f"- {p[:80]}")
                         await feishu_notify.send_text("\n".join(lines))
                 except Exception as e:
                     logger.exception("morning briefing generation failed: %s", e)

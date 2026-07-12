@@ -95,6 +95,11 @@ export default function AITradeReview() {
               AI 输出不可用，已展示本地规则复盘{d.error ? ` · ${String(d.error).slice(0, 80)}` : ''}
             </div>
           )}
+          {!d.fallback && d.source === 'ai_repaired' && (
+            <div className="text-[11px] text-text-muted mb-2">
+              AI 输出已自动修复为结构化复盘
+            </div>
+          )}
 
           {/* 定性 */}
           {d.summary && (

@@ -17,6 +17,8 @@ class HoldingUpdate(BaseModel):
     stock_name: Optional[str] = None
     shares: Optional[int] = None
     cost_price: Optional[float] = None
+    cost_price_override: Optional[float] = None
+    cost_price_override_set: bool = False
     broker: Optional[str] = None
 
 
@@ -27,6 +29,8 @@ class HoldingResponse(BaseModel):
     currency: str = "CNY"
     shares: int
     cost_price: float
+    auto_cost_price: Optional[float] = None
+    cost_price_override: Optional[float] = None
     current_price: Optional[float] = None
     fx_rate: float = 1.0
     fx_time: Optional[str] = None

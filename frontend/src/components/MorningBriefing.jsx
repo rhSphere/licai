@@ -106,7 +106,9 @@ export default function MorningBriefing() {
                     <p className="text-[12px] text-text mt-1 mb-0 leading-relaxed">{b.summary}</p>
                   )}
                   {b.error && (
-                    <p className="text-[11px] text-bear-bright mt-1 mb-0">{b.error}</p>
+                    <p className={`text-[11px] mt-1 mb-0 ${b.llm_skipped ? 'text-text-muted' : 'text-bear-bright'}`}>
+                      {b.error}
+                    </p>
                   )}
                   {b.risk && (
                     <p className="text-[11px] mt-1 mb-0 flex items-start gap-1" style={{ color: '#d4a05c' }}>

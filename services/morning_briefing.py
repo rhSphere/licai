@@ -123,12 +123,54 @@ def _strip_to_json(text: str) -> str:
     return m.group(0) if m else text
 
 
+def _repair_jsonish(text: str) -> str:
+    """Best-effort repair for common OpenAI-compatible/Kimi JSON drift."""
+    body = _strip_to_json(text)
+    # Strip trailing commas before } or ]
+    body = re.sub(r",\s*([}\]])", r"\1", body)
+    # Normalize Chinese quotes occasionally emitted around keys/strings.
+    body = body.replace("“", '"').replace("”", '"')
+    return body
+
+
 def _coerce_points(v) -> list[str]:
     if isinstance(v, list):
         return [str(x).strip()[:80] for x in v if str(x).strip()][:4]
     if isinstance(v, str) and v.strip():
         return [v.strip()[:80]]
     return []
+
+
+def _extract_briefing_from_text(raw: str) -> dict | None:
+    """Extract a usable briefing from non-JSON prose as a last parser step."""
+    text = (raw or "").strip()
+    if not text:
+        return None
+    signal = "中性"
+    for s in ("偏暖", "偏冷", "警惕", "中性"):
+        if s in text:
+            signal = s
+            break
+    lines = []
+    for line in text.splitlines():
+        line = re.sub(r"^[#>*\-\d.、\s]+", "", line).strip()
+        if line and not line.startswith("```"):
+            lines.append(line)
+    if not lines:
+        return None
+    risk = ""
+    for line in lines:
+        if any(k in line for k in ("风险", "警惕", "减持", "处罚", "下滑", "亏损", "破位", "利空")):
+            risk = line[:120]
+            break
+    points = [x[:80] for x in lines[1:5] if x != risk]
+    return {
+        "signal": signal,
+        "summary": lines[0][:80],
+        "points": points[:4],
+        "risk": risk,
+        "confidence": "low",
+    }
 
 
 def _parse_llm_briefing(raw: str) -> dict:
@@ -139,10 +181,16 @@ def _parse_llm_briefing(raw: str) -> dict:
     callers can fall back to a useful local summary instead of showing a broken
     card.
     """
-    body = _strip_to_json(raw)
+    body = _repair_jsonish(raw)
     if not body:
         raise ValueError("empty LLM response")
-    parsed = json.loads(body)
+    try:
+        parsed = json.loads(body)
+    except json.JSONDecodeError:
+        extracted = _extract_briefing_from_text(raw)
+        if extracted:
+            return extracted
+        raise
     if not isinstance(parsed, dict):
         raise ValueError("LLM response is not a JSON object")
     signal = parsed.get("signal") or "中性"
@@ -196,24 +244,25 @@ def _fallback_briefing_from_inputs(*, raw: str, kline_stats: dict, news: list[di
 
     return {
         "signal": "中性",
-        "summary": "LLM 未返回结构化内容，已展示本地摘要",
+        "summary": "已展示本地摘要",
         "points": points,
         "risk": "",
         "confidence": "low",
     }
 
 
-async def generate_briefing_for_stock(stock_code: str, stock_name: str,
-                                      cost_price: float, shares: int,
-                                      current_price: float,
-                                      sector_hint: str = "") -> dict:
-    """Build briefing for one stock/场内ETF. sector_hint: ETF 传主题词(半导体设备/通信…)当行业。"""
+def _is_llm_rate_limited(exc: Exception) -> bool:
+    s = str(exc).lower()
+    return "429" in s or "rate limit" in s or "rate_limit" in s or "too many" in s
+
+
+async def _briefing_inputs(*, stock_code: str, stock_name: str, current_price: float,
+                           cost_price: float, shares: int, sector_hint: str = "") -> dict:
+    """Collect local inputs and construct prompt data. Never calls the LLM."""
     from services.market_data import get_historical_data, get_stock_sector
     from services.news import get_stock_news, get_sector_news, get_stock_announcements
     from services.fundamental_score import fetch_health_snapshot
-    from services.llm_client import call_claude
 
-    # 先拿真实行业(修掉硬编码"有色金属"), 再据此拉对应行业新闻; ETF 直接用主题词
     sector = sector_hint
     if not sector:
         try:
@@ -221,7 +270,6 @@ async def generate_briefing_for_stock(stock_code: str, stock_name: str,
         except Exception:
             sector = ""
 
-    # Gather inputs concurrently
     hist_task = get_historical_data(stock_code)
     news_task = get_stock_news(stock_code, limit=10)
     sector_task = get_sector_news(sector or "大盘", limit=5)
@@ -231,7 +279,6 @@ async def generate_briefing_for_stock(stock_code: str, stock_name: str,
         hist_task, news_task, sector_task, health_task, ann_task,
         return_exceptions=True,
     )
-    # Tolerate any single failure
     if isinstance(hist_df, Exception): hist_df = None
     if isinstance(announcements, Exception): announcements = []
     if isinstance(news, Exception): news = []
@@ -240,7 +287,6 @@ async def generate_briefing_for_stock(stock_code: str, stock_name: str,
 
     pnl_pct = (current_price - cost_price) / cost_price * 100 if cost_price > 0 else 0
     kline_stats = _kline_summary(hist_df)
-
     user_prompt = _build_user_prompt(
         stock_code=stock_code, stock_name=stock_name, sector=sector,
         current_price=current_price, cost_price=cost_price, shares=shares,
@@ -248,52 +294,127 @@ async def generate_briefing_for_stock(stock_code: str, stock_name: str,
         news=news or [], sector_news=sector_news or [],
         announcements=announcements or [], health=health,
     )
+    return {
+        "sector": sector,
+        "pnl_pct": pnl_pct,
+        "kline_stats": kline_stats,
+        "news": news or [],
+        "sector_news": sector_news or [],
+        "announcements": announcements or [],
+        "health": health,
+        "user_prompt": user_prompt,
+    }
+
+
+def _briefing_payload_from_fallback(*, stock_code: str, stock_name: str,
+                                    current_price: float, cost_price: float,
+                                    shares: int, inputs: dict,
+                                    reason: str = "LLM 不可用, 已用本地摘要") -> dict:
+    fallback = _fallback_briefing_from_inputs(
+        raw="",
+        kline_stats=inputs.get("kline_stats") or {},
+        news=inputs.get("news") or [],
+        announcements=inputs.get("announcements") or [],
+        health=inputs.get("health"),
+    )
+    return {
+        "stock_code": stock_code,
+        "stock_name": stock_name,
+        "current_price": current_price,
+        "cost_price": cost_price,
+        "pnl_pct": round(float(inputs.get("pnl_pct") or 0), 2),
+        "sector": inputs.get("sector") or "",
+        "error": reason,
+        "signal": fallback["signal"],
+        "summary": fallback["summary"],
+        "points": fallback["points"],
+        "risk": fallback["risk"],
+        "confidence": fallback["confidence"],
+        "kline_stats": inputs.get("kline_stats") or {},
+        "health_level": (inputs.get("health") or {}).get("level"),
+        "llm_skipped": True,
+    }
+
+
+def _json_repair_prompt(raw: str) -> str:
+    return (
+        "把下面内容改写为严格 JSON 对象, 不要 markdown, 不要解释。"
+        "字段固定为 signal, summary, points, risk, confidence。"
+        "signal 只能是 偏暖/中性/偏冷/警惕; confidence 只能是 high/med/low; points 是字符串数组。\n\n"
+        f"原始内容:\n{(raw or '')[:3000]}"
+    )
+
+
+async def _call_llm_briefing(call_claude, user_prompt: str) -> dict:
+    """Call LLM and robustly coerce output into briefing dict."""
+    raw = await asyncio.to_thread(
+        call_claude, user_prompt, SYSTEM_PROMPT,
+        "fast", 1200, "json_object",
+    )
+    try:
+        return _parse_llm_briefing(raw)
+    except Exception as first_err:
+        # Some OpenAI-compatible providers ignore/relax response_format. Ask the
+        # model to transform its own text into strict JSON once before fallback.
+        if _is_llm_rate_limited(first_err):
+            raise
+        repaired_raw = await asyncio.to_thread(
+            call_claude, _json_repair_prompt(raw),
+            "你是 JSON 修复器, 只输出严格 JSON。", "fast", 700, "json_object",
+        )
+        try:
+            return _parse_llm_briefing(repaired_raw)
+        except Exception:
+            extracted = _extract_briefing_from_text(raw)
+            if extracted:
+                return extracted
+            raise first_err
+
+
+async def generate_briefing_for_stock(stock_code: str, stock_name: str,
+                                      cost_price: float, shares: int,
+                                      current_price: float,
+                                      sector_hint: str = "",
+                                      skip_llm: bool = False) -> dict:
+    """Build briefing for one stock/场内ETF. sector_hint: ETF 传主题词(半导体设备/通信…)当行业。"""
+    from services.llm_client import call_claude
+    inputs = await _briefing_inputs(
+        stock_code=stock_code, stock_name=stock_name, current_price=current_price,
+        cost_price=cost_price, shares=shares, sector_hint=sector_hint,
+    )
+    if skip_llm:
+        return _briefing_payload_from_fallback(
+            stock_code=stock_code, stock_name=stock_name, current_price=current_price,
+            cost_price=cost_price, shares=shares, inputs=inputs,
+            reason="LLM 已跳过, 使用本地摘要",
+        )
 
     try:
-        raw = await asyncio.to_thread(
-            call_claude, user_prompt, SYSTEM_PROMPT,
-            "fast", 1200, "json_object",
-        )
-        parsed = _parse_llm_briefing(raw)
+        parsed = await _call_llm_briefing(call_claude, inputs["user_prompt"])
     except Exception as e:
-        fallback = _fallback_briefing_from_inputs(
-            raw=locals().get("raw", ""),
-            kline_stats=kline_stats,
-            news=news or [],
-            announcements=announcements or [],
-            health=health,
+        reason = "LLM 限流/额度不足, 已用本地摘要" if _is_llm_rate_limited(e) else "AI 摘要暂不可用, 已用本地摘要"
+        payload = _briefing_payload_from_fallback(
+            stock_code=stock_code, stock_name=stock_name, current_price=current_price,
+            cost_price=cost_price, shares=shares, inputs=inputs, reason=reason,
         )
-        return {
-            "stock_code": stock_code,
-            "stock_name": stock_name,
-            "current_price": current_price,
-            "cost_price": cost_price,
-            "pnl_pct": round(pnl_pct, 2),
-            "sector": sector,
-            "error": f"LLM 未返回严格 JSON，已降级展示: {type(e).__name__}: {str(e)[:80]}",
-            "signal": fallback["signal"],
-            "summary": fallback["summary"],
-            "points": fallback["points"],
-            "risk": fallback["risk"],
-            "confidence": fallback["confidence"],
-            "kline_stats": kline_stats,
-            "health_level": (health or {}).get("level"),
-        }
+        if _is_llm_rate_limited(e):
+            payload["llm_rate_limited"] = True
+        return payload
 
     return {
         "stock_code": stock_code,
         "stock_name": stock_name,
         "current_price": current_price,
         "cost_price": cost_price,
-        "pnl_pct": round(pnl_pct, 2),
-        "sector": sector,
+        "pnl_pct": round(float(inputs.get("pnl_pct") or 0), 2),
+        "sector": inputs.get("sector") or "",
         "signal": parsed.get("signal", "中性"),
         "summary": parsed.get("summary", ""),
         "points": parsed.get("points", []),
         "risk": parsed.get("risk", ""),
         "confidence": parsed.get("confidence", "med"),
-        "kline_stats": kline_stats,
-        "health_level": (health or {}).get("level"),
+        "kline_stats": inputs.get("kline_stats") or {},
+        "health_level": (inputs.get("health") or {}).get("level"),
     }
 
 
@@ -333,8 +454,9 @@ async def generate_all_briefings() -> list[dict]:
     # provider org-level rate limits. Kimi/Moonshot may return 429 when many
     # cards are generated back-to-back; keep a small configurable gap.
     llm_gap = max(0.0, float(os.environ.get("LLM_BRIEFING_DELAY", "1.2") or 0))
+    skip_llm_rest = False
     for idx, h in enumerate(holdings):
-        if idx > 0 and llm_gap > 0:
+        if idx > 0 and llm_gap > 0 and not skip_llm_rest:
             await asyncio.sleep(llm_gap)
         code = h["stock_code"]
         q = quotes.get(code) or {}
@@ -345,8 +467,10 @@ async def generate_all_briefings() -> list[dict]:
             briefing = await generate_briefing_for_stock(
                 code, h.get("stock_name", "") or q.get("stock_name", ""),
                 cost_price=h["cost_price"], shares=h["shares"],
-                current_price=cur,
+                current_price=cur, skip_llm=skip_llm_rest,
             )
+            if briefing.get("llm_rate_limited"):
+                skip_llm_rest = True
             briefing["briefing_date"] = today
             await save_briefing(code, today, json.dumps(briefing, ensure_ascii=False))
             results.append(briefing)
@@ -361,7 +485,9 @@ async def generate_all_briefings() -> list[dict]:
         try:
             briefing = await generate_briefing_for_stock(
                 code, e["name"], cost_price=e["cost_price"], shares=int(e["shares"]),
-                current_price=cur, sector_hint=e["theme"])
+                current_price=cur, sector_hint=e["theme"], skip_llm=skip_llm_rest)
+            if briefing.get("llm_rate_limited"):
+                skip_llm_rest = True
             briefing["briefing_date"] = today
             briefing["asset_class"] = "etf"
             await save_briefing(code, today, json.dumps(briefing, ensure_ascii=False))

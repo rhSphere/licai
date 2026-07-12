@@ -5,6 +5,7 @@ export default function EditModal({ holding, onClose, onChange }) {
   const [code, setCode] = useState(holding.stock_code)
   const [shares, setShares] = useState(holding.shares)
   const [cost, setCost] = useState(holding.cost_price)
+  const [useCostOverride, setUseCostOverride] = useState(holding.cost_price_override != null)
   const [saving, setSaving] = useState(false)
 
   const handleSave = async () => {
@@ -16,7 +17,12 @@ export default function EditModal({ holding, onClose, onChange }) {
         await api.deleteHolding(holding.stock_code)
         await api.addHolding({ stock_code: nextCode, stock_name: '', shares: parseInt(shares), cost_price: parseFloat(cost) })
       } else {
-        await api.updateHolding(nextCode, { shares: parseInt(shares), cost_price: parseFloat(cost) })
+        await api.updateHolding(nextCode, {
+          shares: parseInt(shares),
+          cost_price: parseFloat(cost),
+          cost_price_override: useCostOverride ? parseFloat(cost) : null,
+          cost_price_override_set: true,
+        })
       }
       onChange()
       onClose()
@@ -57,6 +63,16 @@ export default function EditModal({ holding, onClose, onChange }) {
             <label className="text-[12px] text-text-dim block mb-1">成本价</label>
             <input type="number" className="w-full bg-bg border border-border rounded-lg px-3 py-2 text-[13px] text-text font-mono outline-none focus:border-accent"
               step={0.0001} value={cost} onChange={e => setCost(e.target.value)} />
+            {holding.auto_cost_price != null && (
+              <div className="text-[10.5px] text-text-muted mt-1 leading-relaxed">
+                流水自动成本: <span className="font-mono">{Number(holding.auto_cost_price).toFixed(4)}</span>。
+                勾选下方后, 当前成本价会作为券商 App 成本覆盖值保存。
+              </div>
+            )}
+            <label className="mt-2 flex items-center gap-2 text-[11px] text-text-dim cursor-pointer select-none">
+              <input type="checkbox" checked={useCostOverride} onChange={e => setUseCostOverride(e.target.checked)} />
+              使用手填成本价覆盖流水自动成本
+            </label>
           </div>
         </div>
 

@@ -35,6 +35,7 @@ import BenchmarkCompare from './components/BenchmarkCompare'
 import Cashflow from './components/Cashflow'
 import AllocationAdvisor from './components/AllocationAdvisor'
 import AShareSectorGap from './components/AShareSectorGap'
+import BulkTradeImport from './components/BulkTradeImport'
 
 export default function App() {
   const [holdings, setHoldings] = useState([])
@@ -127,6 +128,7 @@ export default function App() {
                 dataVersion={dataVersion}
               />
               <DCAManager />
+              <BulkTradeImport onDone={handleHoldingChange} />
             </div>
           )}
 

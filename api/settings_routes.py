@@ -188,6 +188,7 @@ class LLMConfig(BaseModel):
     api_key_prefix: str = ""
     proxy: str = ""
     model_map: dict[str, str] = {}
+    extra_body: dict = {}
     update_api_key: bool = True  # True = apply api_key field; False = keep existing key
 
     @field_validator("base_url")
@@ -209,6 +210,9 @@ class LLMConfig(BaseModel):
             "openai-compatible": "openai_compatible",
             "kimi": "openai_compatible",
             "moonshot": "openai_compatible",
+            "qwen": "openai_compatible",
+            "tongyi": "openai_compatible",
+            "dashscope": "openai_compatible",
         }
         if v not in aliases:
             raise ValueError("provider 必须是 anthropic 或 openai_compatible")
@@ -233,11 +237,19 @@ async def get_llm_config_api():
     db_api_key_prefix = await get_config("llm_api_key_prefix")
     db_proxy = await get_config("llm_proxy")
     db_model_map_raw = await get_config("llm_model_map")
+    db_extra_body_raw = await get_config("llm_extra_body")
     db_model_map = {}
     if db_model_map_raw:
         try:
             import json
             db_model_map = json.loads(db_model_map_raw)
+        except Exception:
+            pass
+    db_extra_body = {}
+    if db_extra_body_raw:
+        try:
+            import json
+            db_extra_body = json.loads(db_extra_body_raw)
         except Exception:
             pass
     return {
@@ -248,6 +260,7 @@ async def get_llm_config_api():
         "api_key_prefix": config["api_key_prefix"],
         "proxy": config["proxy"],
         "model_map": config["model_map"],
+        "extra_body": config.get("extra_body", {}),
         "using_oauth_fallback": config["using_oauth_fallback"],
         "db_provider": db_provider or "anthropic",
         "db_base_url": db_base_url or "",
@@ -255,6 +268,7 @@ async def get_llm_config_api():
         "db_api_key_prefix": db_api_key_prefix or "",
         "db_proxy": db_proxy or "",
         "db_model_map": db_model_map,
+        "db_extra_body": db_extra_body,
     }
 
 
@@ -277,6 +291,7 @@ async def save_llm_config_api(data: LLMConfig):
         await set_config("llm_model_map", json.dumps(model_map, ensure_ascii=False))
     else:
         await set_config("llm_model_map", "")
+    await set_config("llm_extra_body", json.dumps(data.extra_body, ensure_ascii=False) if data.extra_body else "")
 
     llm_client.configure_llm(
         provider=data.provider,
@@ -286,6 +301,7 @@ async def save_llm_config_api(data: LLMConfig):
         api_key_prefix=data.api_key_prefix,
         proxy=data.proxy,
         model_map=model_map or None,
+        extra_body=data.extra_body,
     )
     return {"message": "保存成功"}
 

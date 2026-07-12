@@ -54,6 +54,24 @@ class ActionUpdate(BaseModel):
     broker: Optional[str] = None    # 本笔券商; None=不动, ""=清空(回退持仓默认), 名称=设值
 
 
+class ActionBulkCreate(BaseModel):
+    actions: list[ActionCreate]
+
+
+class ActionBulkDelete(BaseModel):
+    ids: list[int]
+
+
+class ActionImportGroup(BaseModel):
+    stock_code: str
+    stock_name: Optional[str] = ""
+    actions: list[ActionCreate]
+
+
+class ActionImportGroups(BaseModel):
+    groups: list[ActionImportGroup]
+
+
 async def _default_broker_name():
     """配置里的默认券商名(is_default), 没有则第一个。用于显示回退(选"默认券商"时也能打 tag)。"""
     brokers = await list_brokers()
@@ -166,6 +184,9 @@ async def list_holdings() -> list[HoldingResponse]:
                 _st = await dilute_state(code, _st)   # 分红摊薄成本(对齐券商)
                 h["shares"] = _st["shares"]
                 h["cost_price"] = _st["cost_price"]
+                h["auto_cost_price"] = _st["cost_price"]
+                if h.get("cost_price_override") is not None and _st["shares"] > 0:
+                    h["cost_price"] = float(h["cost_price_override"])
                 if _st.get("div_per_share"):
                     h["div_per_share"] = _st["div_per_share"]
                 # 主行券商: 显示当前持仓段实际用的(单一→该券商, 多个→"多券商")
@@ -213,6 +234,8 @@ async def list_holdings() -> list[HoldingResponse]:
             currency=currency,
             shares=h["shares"],
             cost_price=h["cost_price"],
+            auto_cost_price=h.get("auto_cost_price"),
+            cost_price_override=h.get("cost_price_override"),
             current_price=current_price,
             fx_rate=fx_rate,
             fx_time=fx_info.get("time") or "",
@@ -1229,6 +1252,8 @@ async def modify_holding(stock_code: str, data: HoldingUpdate):
         kwargs["shares"] = data.shares
     if data.cost_price is not None:
         kwargs["cost_price"] = data.cost_price
+    if data.cost_price_override_set:
+        kwargs["cost_price_override"] = data.cost_price_override
     if data.broker is not None:
         kwargs["broker"] = data.broker
 
@@ -1347,6 +1372,98 @@ async def create_action(stock_code: str, data: ActionCreate):
     }
 
 
+@router.post("/{stock_code}/actions/bulk")
+async def create_actions_bulk(stock_code: str, data: ActionBulkCreate):
+    """Add multiple buy/sell actions at once and recompute once at the end."""
+    stock_code = normalize_stock_code(stock_code)
+    holding = await get_holding(stock_code)
+    if not holding:
+        raise HTTPException(404, f"持仓 {stock_code} 不存在")
+    if not data.actions:
+        raise HTTPException(400, "没有可导入的记录")
+    if len(data.actions) > 300:
+        raise HTTPException(400, "单次最多导入 300 条记录")
+
+    inserted = 0
+    matched_tranches = []
+    for action in data.actions:
+        matched = await _auto_match_tranche(
+            stock_code, action.action_type, action.price, action.shares,
+        )
+        await add_position_action(
+            stock_code=stock_code,
+            action_type=action.action_type,
+            price=action.price,
+            shares=action.shares,
+            trade_date=action.trade_date,
+            note=action.note or "",
+            tranche_id=(matched["id"] if matched else None),
+            fee=action.fee,
+            trade_time=(action.trade_time or None),
+            broker=(action.broker or None),
+        )
+        inserted += 1
+        if matched:
+            matched_tranches.append({"idx": matched["idx"], "trigger_price": matched["trigger_price"]})
+
+    await _recompute_holding(stock_code)
+    return {
+        "message": "批量导入完成",
+        "inserted": inserted,
+        "matched_tranches": matched_tranches,
+    }
+
+
+async def _ensure_holding_for_import(stock_code: str, stock_name: str = ""):
+    """Ensure a holding row exists so closed-position historical actions can be imported."""
+    existing = await get_holding(stock_code)
+    if existing:
+        if stock_name and not existing.get("stock_name"):
+            await update_holding(stock_code, stock_name=stock_name)
+        return
+    name = stock_name or await get_stock_name(stock_code)
+    await add_holding(stock_code, name or stock_code, 0, 0)
+
+
+@router.post("/actions/import-groups")
+async def import_action_groups(data: ActionImportGroups):
+    """Import multiple symbols' trade histories in one request."""
+    if not data.groups:
+        raise HTTPException(400, "没有可导入的标的")
+    if len(data.groups) > 100:
+        raise HTTPException(400, "单次最多导入 100 个标的")
+    total_actions = sum(len(g.actions) for g in data.groups)
+    if total_actions <= 0:
+        raise HTTPException(400, "没有可导入的记录")
+    if total_actions > 2000:
+        raise HTTPException(400, "单次最多导入 2000 条记录")
+
+    summary = []
+    for group in data.groups:
+        stock_code = normalize_stock_code(group.stock_code)
+        if not group.actions:
+            continue
+        await _ensure_holding_for_import(stock_code, group.stock_name or "")
+        inserted = 0
+        for action in group.actions:
+            await add_position_action(
+                stock_code=stock_code,
+                action_type=action.action_type,
+                price=action.price,
+                shares=action.shares,
+                trade_date=action.trade_date,
+                note=action.note or "",
+                fee=action.fee,
+                trade_time=(action.trade_time or None),
+                broker=(action.broker or None),
+            )
+            inserted += 1
+        await _recompute_holding(stock_code)
+        summary.append({"stock_code": stock_code, "stock_name": group.stock_name or "", "inserted": inserted})
+
+    return {"message": "多标的批量导入完成", "groups": summary, "inserted": sum(x["inserted"] for x in summary)}
+
+
 @router.put("/actions/{action_id}")
 async def modify_action(action_id: int, data: ActionUpdate):
     """Edit an existing action. Recomputes holding aggregate.
@@ -1374,6 +1491,36 @@ async def modify_action(action_id: int, data: ActionUpdate):
     if row:
         await _recompute_holding(row["stock_code"])
     return {"message": "已更新"}
+
+
+@router.post("/{stock_code}/actions/bulk-delete")
+async def delete_actions_bulk(stock_code: str, data: ActionBulkDelete):
+    """Delete multiple actions for one stock and recompute once."""
+    stock_code = normalize_stock_code(stock_code)
+    if not data.ids:
+        raise HTTPException(400, "没有选择要删除的记录")
+    if len(data.ids) > 500:
+        raise HTTPException(400, "单次最多删除 500 条记录")
+
+    from database import get_db
+    db = await get_db()
+    try:
+        placeholders = ",".join(["?"] * len(data.ids))
+        cursor = await db.execute(
+            f"SELECT id FROM position_actions WHERE stock_code = ? AND id IN ({placeholders})",
+            [stock_code, *data.ids],
+        )
+        found = [int(r["id"]) for r in await cursor.fetchall()]
+        if not found:
+            raise HTTPException(404, "没有找到可删除的记录")
+        del_ph = ",".join(["?"] * len(found))
+        await db.execute(f"DELETE FROM position_actions WHERE id IN ({del_ph})", found)
+        await db.commit()
+    finally:
+        await db.close()
+
+    await _recompute_holding(stock_code)
+    return {"message": "批量删除完成", "deleted": len(found)}
 
 
 @router.delete("/actions/{action_id}")

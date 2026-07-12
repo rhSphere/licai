@@ -53,6 +53,9 @@ _PROVIDER_ALIASES = {
     "openai-compatible": "openai_compatible",
     "kimi": "openai_compatible",
     "moonshot": "openai_compatible",
+    "qwen": "openai_compatible",
+    "tongyi": "openai_compatible",
+    "dashscope": "openai_compatible",
 }
 
 # ── 运行时可变状态 ─────────────────────────────────────
@@ -65,6 +68,7 @@ _api_key: str = os.environ.get("LLM_API_KEY", "")
 _api_key_header: str = os.environ.get("LLM_API_KEY_HEADER", "") or _DEFAULT_API_KEY_HEADER
 _api_key_prefix: str = os.environ.get("LLM_API_KEY_PREFIX", "")
 _model_map: dict[str, str] = {}
+_extra_body: dict = {}
 _proxy_url: str = os.environ.get("LLM_PROXY", "")
 _config_lock = threading.Lock()
 
@@ -108,10 +112,26 @@ def _parse_model_map(raw: str | None) -> dict[str, str]:
     return {}
 
 
+def _parse_extra_body(raw: str | None) -> dict:
+    """Parse arbitrary OpenAI-compatible provider extension JSON."""
+    if not raw or not raw.strip():
+        return {}
+    try:
+        d = json.loads(raw)
+        return d if isinstance(d, dict) else {}
+    except (json.JSONDecodeError, TypeError):
+        logger.warning("extra_body: invalid JSON, ignoring: %s", raw[:100])
+        return {}
+
+
 # Apply env var model map immediately
 _env_map = os.environ.get("LLM_MODEL_MAP", "")
 if _env_map:
     _model_map = _parse_model_map(_env_map)
+
+_env_extra_body = os.environ.get("LLM_EXTRA_BODY", "")
+if _env_extra_body:
+    _extra_body = _parse_extra_body(_env_extra_body)
 
 
 # ── 重试配置 ──────────────────────────────────────────
@@ -188,12 +208,13 @@ def configure_llm(
     api_key_prefix: str = "",
     proxy: str = "",
     model_map: dict[str, str] | None = None,
+    extra_body: dict | None = None,
 ):
     """运行时更新 LLM 配置 (从 DB 加载后调用)。
 
     环境变量优先级最高, 这里只设置 '没被 env var 覆盖' 的项。
     """
-    global _base_url, _provider, _api_key, _api_key_header, _api_key_prefix, _proxy_url, _model_map
+    global _base_url, _provider, _api_key, _api_key_header, _api_key_prefix, _proxy_url, _model_map, _extra_body
 
     with _config_lock:
         if not os.environ.get("LLM_PROVIDER") and provider:
@@ -211,6 +232,8 @@ def configure_llm(
             _apply_proxy()
         if not os.environ.get("LLM_MODEL_MAP") and model_map is not None:
             _model_map = model_map
+        if not os.environ.get("LLM_EXTRA_BODY") and extra_body is not None:
+            _extra_body = extra_body
 
 
 def get_llm_config() -> dict:
@@ -224,6 +247,7 @@ def get_llm_config() -> dict:
         "api_key_prefix": _api_key_prefix,
         "proxy": _proxy_url,
         "model_map": _model_map,
+        "extra_body": _extra_body,
         "using_oauth_fallback": not _api_key and not os.environ.get("ANTHROPIC_API_KEY", "").strip(),
     }
 
@@ -743,6 +767,8 @@ def call_claude(
                 [{"role": "user", "content": user_prompt}], system or ""
             ),
         }
+        if _extra_body:
+            payload.update(_extra_body)
         if response_format == "json_object":
             payload["response_format"] = {"type": "json_object"}
     else:
@@ -805,6 +831,8 @@ def call_claude_messages(
             "max_tokens": max_tokens,
             "messages": _anthropic_messages_to_openai(messages, system or ""),
         }
+        if _extra_body:
+            payload.update(_extra_body)
         ot = _anthropic_tools_to_openai(tools)
         if ot:
             payload["tools"] = ot
@@ -852,6 +880,8 @@ def test_connection() -> dict:
                     [{"role": "user", "content": "Say ok"}], "Reply with just 'ok'."
                 ),
             }
+            if _extra_body:
+                payload.update(_extra_body)
         else:
             payload = {
                 "model": model,

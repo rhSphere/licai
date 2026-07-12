@@ -21,7 +21,7 @@ export default function SectorMatrix() {
   const [m, setM] = useState(cached?.m || null)
   const [ai, setAi] = useState(cached?.ai || null)
   const [loading, setLoading] = useState(!cached)
-  const [aiLoading, setAiLoading] = useState(!cached?.ai)
+  const [aiLoading, setAiLoading] = useState(false)
 
   const load = useCallback((dy, force = false) => {
     const cache = readCache(dy)
@@ -29,13 +29,18 @@ export default function SectorMatrix() {
     if (cache?.m) setM(cache.m)
     if (cache?.ai) setAi(cache.ai)
     setLoading(!cache?.m || force)
-    setAiLoading(!cache?.ai || force)
     let nm = cache?.m || null, na = cache?.ai || null
     fetchJSON(`/api/sector/matrix?days=${dy}${force ? '&force=true' : ''}`)
       .then(r => { nm = r; setM(r); writeCache(dy, nm, na) }).catch(() => {}).finally(() => setLoading(false))
+  }, [])
+
+  const loadAi = useCallback((dy, force = false) => {
+    setAiLoading(true)
+    let nm = readCache(dy)?.m || m
+    let na = ai
     fetchJSON(`/api/sector/trend-ai?days=${dy}${force ? '&force=true' : ''}`)
       .then(r => { na = r; setAi(r); writeCache(dy, nm, na) }).catch(() => {}).finally(() => setAiLoading(false))
-  }, [])
+  }, [ai, m])
 
   useEffect(() => { load(days) }, [days, load])
 
@@ -59,15 +64,19 @@ export default function SectorMatrix() {
               {dy}日
             </button>
           ))}
-          <button onClick={() => load(days, true)} disabled={loading || aiLoading}
+          <button onClick={() => load(days, true)} disabled={loading}
             className="text-[11px] px-2 py-0.5 rounded border border-border text-text-dim hover:text-text disabled:opacity-40 disabled:cursor-wait">
-            {(loading || aiLoading) ? '刷新中…' : '刷新'}
+            {loading ? '刷新中…' : '刷新'}
+          </button>
+          <button onClick={() => loadAi(days, true)} disabled={aiLoading}
+            className="text-[11px] px-2 py-0.5 rounded border border-accent/40 text-accent hover:bg-accent/10 disabled:opacity-40 disabled:cursor-wait">
+            {aiLoading ? 'AI中…' : 'AI分析'}
           </button>
         </div>
       </div>
 
       {/* AI 趋势分析 */}
-      {aiLoading && !ai?.summary && <div className="text-[11.5px] text-text-dim mb-3">AI 分析板块趋势中…<span className="text-text-muted">(Opus 推理约 10–20 秒)</span></div>}
+      {aiLoading && !ai?.summary && <div className="text-[11.5px] text-text-dim mb-3">AI 分析板块趋势中…<span className="text-text-muted">(约 10–20 秒)</span></div>}
       {ai && ai.summary && (
         <div className={`mb-3 px-3 py-2.5 rounded-lg bg-accent/10 border border-accent/30 transition-opacity ${aiLoading ? 'opacity-50' : ''}`}>
           <div className="flex items-baseline justify-between gap-2 mb-1.5">

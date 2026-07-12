@@ -1,5 +1,6 @@
 const ICONS = {
   portfolio: <><rect x="4" y="8" width="16" height="11" rx="2" /><path d="M9 8V6a2 2 0 012-2h2a2 2 0 012 2v2M4 13h16" /></>,
+  unwind: <><path d="M4 17l5-5 4 3 7-8" /><path d="M14 7h6v6" /><path d="M5 21h14" /></>,
   sector: <><rect x="4" y="4" width="7" height="7" rx="1" /><rect x="13" y="4" width="7" height="7" rx="1" /><rect x="4" y="13" width="7" height="7" rx="1" /><rect x="13" y="13" width="7" height="7" rx="1" /></>,
   rankings: <><path d="M8 4h8v4a4 4 0 01-8 0z" /><path d="M8 5H5v1a3 3 0 003 3M16 5h3v1a3 3 0 01-3 3M10 15h4M9 19.5h6M12 15v4.5" /></>,
   // 大盘·股池: 三档收窄的梯队(首板 → 2 连板 → 3 板及以上), 和 sector 那个等大四宫格区分得开

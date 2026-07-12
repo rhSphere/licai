@@ -27,6 +27,7 @@ import AnalyzerLists from './components/AnalyzerLists'
 import ProviderInstTheme from './components/ProviderInstTheme'
 import MacroDashboard from './components/MacroDashboard'
 import PortfolioNews from './components/PortfolioNews'
+import AITradeReview from './components/AITradeReview'
 // 我的·资金现金流
 import Cashflow from './components/Cashflow'
 // 我的·绩效基准
@@ -38,7 +39,6 @@ import PortfolioCorrelation from './components/PortfolioCorrelation'
 import AllocationAdvisor from './components/AllocationAdvisor'
 import AShareSectorGap from './components/AShareSectorGap'
 // 我的·复盘
-import AITradeReview from './components/AITradeReview'
 import EntryReview from './components/EntryReview'
 
 // 合法 view key。setView 与 hash 初始化共用 —— 只在初始化校验的话,
@@ -314,7 +314,8 @@ export default function App() {
 
           {/* 视图内容: 唯一滚动区 — 侧边栏/顶栏/仪表盘全部固定 */}
           <div className="flex-1 min-h-0 overflow-y-auto">
-            {PAGES[view]
+
+          {PAGES[view]
               ? PAGES[view]()
               /* 侧栏点得到、这里却没有对应页 —— 原来是一片空白内容区, 什么都不说。
                  这个坑真踩过一次(关设置时 setView('dashboard'), 而 dashboard 不是任何一页),
@@ -324,6 +325,70 @@ export default function App() {
                   这一页还没接上内容(view=<code className="text-text">{view}</code>)。
                 </div>
               )}
+          </div>
+          )}
+
+          {view === 'unwind' && (
+            <div className={`${PAD} space-y-3 md:space-y-4`}>
+              <UnwindView />
+            </div>
+          )}
+
+          {view === 'sector' && (
+            <div className={`${PAD} space-y-3 md:space-y-4`}>
+              <MorningBriefing />
+              <MarketAIInsights />
+              <SentimentThermometer />
+              <EtfXray />
+              <SectorMatrix />
+              <HotRank />
+              <SectorRadar />
+              <SectorOpportunities />
+            </div>
+          )}
+
+          {view === 'rankings' && (
+            <div className={PAD}>
+              <Rankings />
+            </div>
+          )}
+
+          {view === 'macro' && (
+            <div className={`${PAD} space-y-3 md:space-y-4`}>
+              <MacroDashboard />
+            </div>
+          )}
+
+          {view === 'news' && (
+            <div className={`${PAD} space-y-3 md:space-y-4`}>
+              <PortfolioNews />
+            </div>
+          )}
+
+          {view === 'review' && (
+            <div className={`${PAD} space-y-3 md:space-y-4`}>
+              <AITradeReview />
+              <TradeReview />
+              <TradeJournal />
+              <ThesisReview />
+              <BenchmarkCompare />
+              <Cashflow />
+              <AllocationAdvisor />
+              <AShareSectorGap />
+            </div>
+          )}
+
+          {view === 'ask' && (
+            <div className={`${PAD} max-w-[900px] h-[calc(100vh-8rem)]`}>
+              <StockAsk page />
+            </div>
+          )}
+
+          {view === 'settings' && (
+            <div className={`${PAD} max-w-[900px]`}>
+              <Settings onClose={() => setView('dashboard')} />
+            </div>
+          )}
           </div>
         </main>
       </div>

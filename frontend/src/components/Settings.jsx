@@ -1,13 +1,8 @@
 import { useEffect, useState } from 'react'
 import { api, fetchJSON } from '../hooks/useApi'
-import { AttributionSection } from './settings/AttributionSection'
-import { ProviderSection } from './settings/ProviderSection'
-import { LLMConfigSection } from './settings/LLMConfigSection'
-import { OkxSpotSection } from './settings/OkxSpotSection'
-import { PromptRulesSection } from './settings/PromptRulesSection'
-import { ProxySection } from './settings/ProxySection'
-import { ZsxqSection } from './settings/ZsxqSection'
-
+import DataBackup from './DataBackup'
+import BrokerSettings from './BrokerSettings'
+import SystemHealth from './SystemHealth'
 
 export default function Settings({ onClose }) {
   const [url, setUrl] = useState('')
@@ -23,7 +18,7 @@ export default function Settings({ onClose }) {
   const [okxSaving, setOkxSaving] = useState(false)
 
   const loadOkxStatus = async () => {
-    try { setOkxStatus(await fetchJSON('/api/assets/okx/status')) } catch {}
+    try { setOkxStatus(await fetchJSON('/api/assets/okx/status')) } catch { setOkxStatus(null) }
   }
 
   useEffect(() => {
@@ -68,7 +63,9 @@ export default function Settings({ onClose }) {
       await fetchJSON('/api/assets/okx/credentials', { method: 'DELETE' })
       setOkxStatusText({ text: '已清除', ok: true })
       await loadOkxStatus()
-    } catch {}
+    } catch (e) {
+      setOkxStatusText({ text: '清除失败：' + (e.message || e), ok: false })
+    }
   }
 
   const handleSave = async () => {
@@ -103,6 +100,8 @@ export default function Settings({ onClose }) {
         </button>
       </div>
       <div className="p-4 space-y-3">
+        <SystemHealth />
+
         <div>
           <label className="text-[12px] text-text-dim block mb-1">飞书 Webhook URL</label>
           <p className="text-[11px] text-text-muted mb-2">
@@ -202,33 +201,285 @@ export default function Settings({ onClose }) {
           <LLMConfigSection />
         </div>
 
-        {/* 知识星球(可选, 只读) */}
+        {/* 数据备份 */}
         <div className="mt-2 pt-4 border-t border-border">
-          <ZsxqSection />
+          <DataBackup />
         </div>
 
-        {/* 扩展数据源(可选): 深度龙虎榜席位身份 / 竞价异动 / 机构增仓等自带公开源没有的口径 */}
+        {/* 券商费率 */}
         <div className="mt-2 pt-4 border-t border-border">
-          <ProviderSection />
-        </div>
-
-        {/* OKX 策略之外的现货 */}
-        {okxStatus?.configured && (
-          <div className="mt-2 pt-4 border-t border-border">
-            <OkxSpotSection />
-          </div>
-        )}
-
-        {/* 从纠正里沉淀出来的规则(待审队列) */}
-        <div className="mt-2 pt-4 border-t border-border">
-          <PromptRulesSection />
-        </div>
-
-        {/* 开源许可 */}
-        <div className="mt-2 pt-4 border-t border-border">
-          <AttributionSection />
+          <BrokerSettings />
         </div>
       </div>
     </section>
+  )
+}
+
+function ProxySection() {
+  const [proxy, setProxy] = useState('')
+  const [effective, setEffective] = useState('')
+  const [status, setStatus] = useState({ text: '', ok: null })
+  const [busy, setBusy] = useState('')   // '' | save | test | detect
+
+  useEffect(() => {
+    api.getProxy().then(d => {
+      setProxy(d.db_proxy || '')
+      setEffective(d.proxy || '')
+    }).catch(() => {})
+  }, [])
+
+  const save = async () => {
+    setBusy('save'); setStatus({ text: '保存中...', ok: null })
+    try {
+      const r = await api.saveProxy(proxy.trim())
+      setEffective(r.proxy || '')
+      setStatus({ text: r.proxy ? (r.ok ? '已保存 · 连接正常' : '已保存 · 但连不上') : '已保存 · 直连', ok: r.ok || !r.proxy })
+    } catch (e) { setStatus({ text: '保存失败: ' + (e.message || e), ok: false }) }
+    setBusy('')
+  }
+
+  const detect = async () => {
+    setBusy('detect'); setStatus({ text: '探测中...', ok: null })
+    try {
+      const r = await api.detectProxy()
+      if (r.ok) { setProxy(r.proxy); setEffective(r.proxy); setStatus({ text: '探测到: ' + r.proxy, ok: true }) }
+      else setStatus({ text: r.error || '未探测到可用代理', ok: false })
+    } catch (e) { setStatus({ text: '探测失败: ' + (e.message || e), ok: false }) }
+    setBusy('')
+  }
+
+  const test = async () => {
+    setBusy('test'); setStatus({ text: '测试中...', ok: null })
+    try {
+      const r = await api.testProxy(proxy.trim())
+      setStatus({ text: r.ok ? '连接正常 ✓' : (r.error || '连不上'), ok: r.ok })
+    } catch (e) { setStatus({ text: '测试失败: ' + (e.message || e), ok: false }) }
+    setBusy('')
+  }
+
+  return (
+    <>
+      <div className="flex items-center justify-between mb-2">
+        <label className="text-[12px] text-text-dim font-semibold">本地代理</label>
+        {effective && <span className="text-[11px] text-text-muted font-mono">生效: {effective}</span>}
+      </div>
+      <p className="text-[11px] text-text-muted mb-2 leading-relaxed">
+        海外接口同步 / 外发请求统一走这个本地代理。代理重启后端口可能变化,
+        点<span className="text-accent">自动探测</span>让它自己找,不用手改。
+        留空=直连。<span className="text-[var(--color-signal-moderate)]">境内行情源始终直连,不受影响。</span>
+      </p>
+      <div className="flex items-center gap-2 mb-2">
+        <input
+          className="flex-1 bg-bg border border-border rounded px-3 py-1.5 text-[12px] text-text font-mono outline-none focus:border-accent"
+          placeholder="http://127.0.0.1:7890(留空=直连)"
+          value={proxy} onChange={e => setProxy(e.target.value)}
+        />
+        <button onClick={detect} disabled={!!busy}
+          className="px-3 py-1.5 rounded-md border border-accent/50 text-accent text-[12px] hover:bg-accent/10 disabled:opacity-50 cursor-pointer whitespace-nowrap">
+          {busy === 'detect' ? '探测中' : '自动探测'}
+        </button>
+      </div>
+      <div className="flex items-center gap-3">
+        <button onClick={save} disabled={!!busy}
+          className="px-4 py-1.5 rounded-md bg-accent text-bg font-medium text-[13px] hover:opacity-90 disabled:opacity-50 cursor-pointer">
+          {busy === 'save' ? '保存中...' : '保存'}
+        </button>
+        <button onClick={test} disabled={!!busy}
+          className="px-4 py-1.5 rounded-md border border-border text-text-dim text-[13px] hover:text-text transition-colors cursor-pointer">
+          {busy === 'test' ? '测试中...' : '测试连接'}
+        </button>
+        {status.text && (
+          <span className={`text-[12px] font-medium break-all
+            ${status.ok === true ? 'text-bull' : status.ok === false ? 'text-bear' : 'text-text-dim'}`}>
+            {status.text}
+          </span>
+        )}
+      </div>
+    </>
+  )
+}
+
+function LLMConfigSection() {
+  const [provider, setProvider] = useState('anthropic')
+  const [baseUrl, setBaseUrl] = useState('')
+  const [apiKey, setApiKey] = useState('')
+  const [apiKeyHeader, setApiKeyHeader] = useState('x-api-key')
+  const [apiKeyPrefix, setApiKeyPrefix] = useState('')
+  const [proxy, setProxy] = useState('')
+  const [modelMap, setModelMap] = useState('')
+  const [status, setStatus] = useState({ text: '', ok: null })
+  const [saving, setSaving] = useState(false)
+  const [testing, setTesting] = useState(false)
+  const [dbHasKey, setDbHasKey] = useState(false)
+
+  useEffect(() => {
+    api.getLLMConfig().then(d => {
+      setProvider(d.db_provider || 'anthropic')
+      setBaseUrl(d.db_base_url || '')
+      setDbHasKey(d.has_api_key)
+      setApiKeyHeader(d.db_api_key_header || 'x-api-key')
+      setApiKeyPrefix(d.db_api_key_prefix || '')
+      setProxy(d.db_proxy || '')
+      setModelMap(d.db_model_map && Object.keys(d.db_model_map).length ? JSON.stringify(d.db_model_map, null, 2) : '')
+    }).catch(() => {})
+  }, [])
+
+  const handleSave = async () => {
+    setSaving(true)
+    try {
+      let modelMapObj = {}
+      if (modelMap.trim()) {
+        try { modelMapObj = JSON.parse(modelMap) } catch {
+          setStatus({ text: '模型映射 JSON 格式错误', ok: false })
+          setSaving(false)
+          return
+        }
+      }
+      await api.saveLLMConfig({
+        provider,
+        base_url: baseUrl.trim(),
+        api_key: apiKey.trim() || (dbHasKey ? '****' : ''),
+        api_key_header: apiKeyHeader.trim() || 'x-api-key',
+        api_key_prefix: apiKeyPrefix.trim(),
+        proxy: proxy.trim(),
+        model_map: modelMapObj,
+        update_api_key: apiKey.trim().length > 0,
+      })
+      setStatus({ text: '已保存', ok: true })
+      if (apiKey.trim()) setDbHasKey(true)
+      setApiKey('')
+    } catch (e) {
+      setStatus({ text: '保存失败: ' + (e.message || e), ok: false })
+    }
+    setSaving(false)
+  }
+
+  const handleTest = async () => {
+    setTesting(true)
+    setStatus({ text: '测试中...', ok: null })
+    try {
+      const r = await api.testLLM()
+      if (r.ok) {
+        setStatus({ text: `连接成功 · ${r.model} · ${r.latency_ms}ms`, ok: true })
+      } else {
+        setStatus({ text: `失败: ${r.error}`, ok: false })
+      }
+    } catch (e) {
+      setStatus({ text: '测试失败: ' + (e.message || e), ok: false })
+    }
+    setTesting(false)
+  }
+
+  return (
+    <>
+      <label className="text-[12px] text-text-dim font-semibold">LLM 配置</label>
+      <p className="text-[11px] text-text-muted mb-2 leading-relaxed">
+        支持 Anthropic Messages 协议，以及 Kimi/Moonshot 等 OpenAI-compatible 接口。
+        不配置则走原有 Anthropic 官方 + Keychain OAuth。
+      </p>
+
+      <div className="grid grid-cols-1 gap-2 mb-2">
+        <div>
+          <label className="text-[11px] text-text-muted">Provider</label>
+          <select
+            className="w-full bg-bg border border-border rounded px-3 py-1.5 text-[12px] text-text outline-none focus:border-accent"
+            value={provider}
+            onChange={e => {
+              const v = e.target.value
+              setProvider(v)
+              if (v === 'openai_compatible') {
+                setBaseUrl(prev => prev || 'https://api.moonshot.cn/v1')
+                setApiKeyHeader('Authorization')
+                setApiKeyPrefix('Bearer')
+                setModelMap(prev => prev || JSON.stringify({ smart: 'kimi-k2.6', balanced: 'kimi-k2.6', fast: 'kimi-k2.6' }, null, 2))
+              } else {
+                setBaseUrl(prev => prev || 'https://api.anthropic.com')
+                setApiKeyHeader('x-api-key')
+                setApiKeyPrefix('')
+              }
+            }}
+          >
+            <option value="anthropic">Anthropic / Claude</option>
+            <option value="openai_compatible">OpenAI-compatible / Kimi</option>
+          </select>
+          <p className="text-[10px] text-text-muted mt-0.5">
+            Kimi 使用 OpenAI-compatible: https://api.moonshot.cn/v1 + Authorization: Bearer。
+          </p>
+        </div>
+
+        <div>
+          <label className="text-[11px] text-text-muted">API Base URL</label>
+          <input
+            className="w-full bg-bg border border-border rounded px-3 py-1.5 text-[12px] text-text font-mono outline-none focus:border-accent"
+            placeholder={provider === 'openai_compatible' ? 'https://api.moonshot.cn/v1' : 'https://api.anthropic.com'}
+            value={baseUrl} onChange={e => setBaseUrl(e.target.value)}
+          />
+        </div>
+
+        <div className="grid grid-cols-2 gap-2">
+          <div>
+            <label className="text-[11px] text-text-muted">API Key Header</label>
+            <input
+              className="w-full bg-bg border border-border rounded px-3 py-1.5 text-[12px] text-text font-mono outline-none focus:border-accent"
+              placeholder="x-api-key"
+              value={apiKeyHeader} onChange={e => setApiKeyHeader(e.target.value)}
+            />
+          </div>
+          <div>
+            <label className="text-[11px] text-text-muted">API Key Prefix（如 Bearer）</label>
+            <input
+              className="w-full bg-bg border border-border rounded px-3 py-1.5 text-[12px] text-text font-mono outline-none focus:border-accent"
+              placeholder="留空或填 Bearer"
+              value={apiKeyPrefix} onChange={e => setApiKeyPrefix(e.target.value)}
+            />
+          </div>
+        </div>
+
+        <div>
+          <label className="text-[11px] text-text-muted">API Key {dbHasKey && <span className="text-bull">（已保存，留空则不动）</span>}</label>
+          <input type="password"
+            className="w-full bg-bg border border-border rounded px-3 py-1.5 text-[12px] text-text font-mono outline-none focus:border-accent"
+            placeholder={dbHasKey ? '输入新 key 覆盖，留空保持原 key' : 'sk-...'}
+            value={apiKey} onChange={e => setApiKey(e.target.value)}
+          />
+        </div>
+
+        <div>
+          <label className="text-[11px] text-text-muted">HTTP 代理（可选）</label>
+          <input
+            className="w-full bg-bg border border-border rounded px-3 py-1.5 text-[12px] text-text font-mono outline-none focus:border-accent"
+            placeholder="http://127.0.0.1:7890"
+            value={proxy} onChange={e => setProxy(e.target.value)}
+          />
+        </div>
+
+        <div>
+          <label className="text-[11px] text-text-muted">模型别名映射（JSON，可选）</label>
+          <textarea rows={3}
+            className="w-full bg-bg border border-border rounded px-3 py-1.5 text-[12px] text-text font-mono outline-none focus:border-accent resize-none"
+            placeholder={provider === 'openai_compatible' ? '{"smart":"kimi-k2.6","balanced":"kimi-k2.6","fast":"kimi-k2.6"}' : '{"smart":"claude-opus-4-8","balanced":"claude-sonnet-4-6","fast":"claude-sonnet-4-6"}'}
+            value={modelMap} onChange={e => setModelMap(e.target.value)}
+          />
+          <p className="text-[10px] text-text-muted mt-0.5">逻辑名: smart / balanced / fast → 实际模型名</p>
+        </div>
+      </div>
+
+      <div className="flex items-center gap-3">
+        <button onClick={handleSave} disabled={saving}
+          className="px-4 py-1.5 rounded-md bg-accent text-bg font-medium text-[13px] hover:opacity-90 disabled:opacity-50 cursor-pointer">
+          {saving ? '保存中...' : '保存'}
+        </button>
+        <button onClick={handleTest} disabled={testing}
+          className="px-4 py-1.5 rounded-md border border-border text-text-dim text-[13px] hover:text-text transition-colors cursor-pointer">
+          {testing ? '测试中...' : '测试连接'}
+        </button>
+        {status.text && (
+          <span className={`text-[12px] font-medium break-all
+            ${status.ok === true ? 'text-bull' : status.ok === false ? 'text-bear' : 'text-text-dim'}`}>
+            {status.text}
+          </span>
+        )}
+      </div>
+    </>
   )
 }

@@ -19,6 +19,8 @@ export default function MorningBriefing() {
   const [data, setData] = useState(null)
   const [loading, setLoading] = useState(false)
   const [refreshing, setRefreshing] = useState(false)
+  const [refreshingOne, setRefreshingOne] = useState('')
+  const [oneStatus, setOneStatus] = useState({})
   const [expanded, setExpanded] = useState({})
 
   const load = useCallback(async () => {
@@ -38,6 +40,32 @@ export default function MorningBriefing() {
       await load()
     } catch (e) { console.error(e) }
     finally { setRefreshing(false) }
+  }
+
+  const refreshOne = async (code) => {
+    if (!code || refreshingOne) return
+    setRefreshingOne(code)
+    setOneStatus(s => ({ ...s, [code]: 'loading' }))
+    try {
+      const res = await fetchJSON(`/api/briefing/refresh/${encodeURIComponent(code)}`, { method: 'POST' })
+      const next = res.briefing
+      if (next) {
+        setData(d => ({
+          ...(d || {}),
+          date: res.date || d?.date,
+          is_today: true,
+          briefings: (d?.briefings || []).map(b => b.stock_code === code ? next : b),
+        }))
+      } else {
+        await load()
+      }
+      setOneStatus(s => ({ ...s, [code]: 'done' }))
+      setTimeout(() => setOneStatus(s => ({ ...s, [code]: s[code] === 'done' ? '' : s[code] })), 1800)
+    } catch (e) {
+      console.error(e)
+      setOneStatus(s => ({ ...s, [code]: 'error' }))
+      setTimeout(() => setOneStatus(s => ({ ...s, [code]: s[code] === 'error' ? '' : s[code] })), 2500)
+    } finally { setRefreshingOne('') }
   }
 
   if (loading && !data) return <SkeletonCard rows={3} label="早盘简报生成中" />
@@ -82,9 +110,11 @@ export default function MorningBriefing() {
           const conf = CONFIDENCE_META[b.confidence] || CONFIDENCE_META.med
           const hasDetail = (b.points && b.points.length > 0) || b.risk
           const isExp = expanded[b.stock_code]
+          const st = oneStatus[b.stock_code]
+          const isRefreshingThis = refreshingOne === b.stock_code || st === 'loading'
           return (
-            <div key={b.stock_code} className="px-3 md:px-5 py-3"
-              style={{ borderLeft: `3px solid ${meta.color}` }}>
+            <div key={b.stock_code} className={`px-3 md:px-5 py-3 transition-colors duration-300 ${isRefreshingThis ? 'bg-accent/5' : st === 'done' ? 'bg-bull/5' : st === 'error' ? 'bg-bear/5' : ''}`}
+              style={{ borderLeft: `3px solid ${st === 'done' ? '#5fa86c' : st === 'error' ? '#cf5c5c' : meta.color}` }}>
               <div className="flex items-start gap-3">
                 <span className="inline-flex items-center gap-1 text-[11px] font-semibold px-2 py-[2px] rounded shrink-0"
                   style={{ background: meta.bg, color: meta.color, border: `1px solid ${meta.color}50` }}>
@@ -101,6 +131,11 @@ export default function MorningBriefing() {
                     <span className="text-[10px] text-text-muted ml-auto">
                       置信度 <span style={{ color: conf.color }}>{conf.label}</span>
                     </span>
+                    <button onClick={() => refreshOne(b.stock_code)} disabled={!!refreshingOne || refreshing}
+                      className={`inline-flex items-center gap-1 text-[10px] px-1.5 py-[1px] rounded border transition-colors disabled:opacity-60 cursor-pointer ${st === 'done' ? 'border-bull/40 text-bull' : st === 'error' ? 'border-bear/40 text-bear' : 'border-border text-text-dim hover:text-accent hover:border-accent/50'}`}>
+                      {isRefreshingThis && <span className="inline-block animate-spin">↻</span>}
+                      <span>{isRefreshingThis ? '刷新中' : st === 'done' ? '已更新' : st === 'error' ? '失败' : '刷新本只'}</span>
+                    </button>
                   </div>
                   {b.summary && (
                     <p className="text-[12px] text-text mt-1 mb-0 leading-relaxed">{b.summary}</p>

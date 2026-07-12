@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS holdings (
     stock_name TEXT NOT NULL DEFAULT '',
     shares INTEGER NOT NULL,
     cost_price REAL NOT NULL,
+    cost_price_override REAL,
     purchase_date TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -616,6 +617,11 @@ async def init_db():
             await db.execute(
                 "INSERT OR IGNORE INTO app_config (key, value) VALUES "
                 "('watchlist_default_group_filled', '1')")
+cursor = await db.execute("PRAGMA table_info(holdings)")
+        holding_cols = {row[1] for row in await cursor.fetchall()}
+        if "cost_price_override" not in holding_cols:
+            # 用户手动覆盖的券商 App 成本价. NULL = 按流水自动计算.
+            await db.execute("ALTER TABLE holdings ADD COLUMN cost_price_override REAL")
         # Migration: add trade_time to external_asset_actions
         cursor = await db.execute("PRAGMA table_info(external_asset_actions)")
         eaa_cols = {row[1] for row in await cursor.fetchall()}
@@ -828,8 +834,9 @@ async def update_holding(stock_code: str, **kwargs):
     try:
         sets = []
         vals = []
+        nullable = {"cost_price_override"}
         for k, v in kwargs.items():
-            if v is not None:
+            if v is not None or k in nullable:
                 sets.append(f"{k} = ?")
                 vals.append(v)
         if not sets:

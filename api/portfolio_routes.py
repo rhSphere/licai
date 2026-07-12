@@ -583,6 +583,121 @@ def _parse_llm_json(raw):
     return out
 
 
+def _looks_placeholder_review(result: dict) -> bool:
+    """Detect schema/template echoes or effectively empty LLM output."""
+    if not result:
+        return True
+    summary = str(result.get("summary") or "").strip()
+    narrative = str(result.get("narrative") or "").strip()
+    good = result.get("good") or []
+    disc = result.get("discipline") or []
+    templ = ("一句话客观定性" in summary or "一句话点评" in summary or
+             "好坏都讲" in summary or "2-3段复盘正文" in narrative or "1-2段复盘正文" in narrative)
+    return templ or (not summary and not narrative and not good and not disc)
+
+
+def _local_period_review(*, period: str, label: str, ptrades: list, nb: int, ns: int,
+                         market_fit: str = "", error: str = "") -> dict:
+    """Deterministic fallback when LLM is empty/bad."""
+    import time
+    buys = [t for t in ptrades if t.get("kind") == "buy"]
+    sells = [t for t in ptrades if t.get("kind") == "sell"]
+    names = list(dict.fromkeys(t.get("name") for t in ptrades if t.get("name")))
+    summary = f"{label}共{len(ptrades)}笔交易，{nb}买{ns}卖，涉及{len(names)}个标的。"
+    good = []
+    discipline = []
+    if sells:
+        good.append(f"有{len(sells)}笔卖出/减仓，说明有兑现或降风险动作。")
+    if buys and sells:
+        good.append("买卖动作都有记录，后续可用流水复盘节奏。")
+    if len(ptrades) >= 6:
+        discipline.append({
+            "problem": "交易笔数偏多",
+            "evidence": f"{label}内记录{len(ptrades)}笔交易。",
+            "why": "需要区分计划内分批和临场情绪化交易。",
+        })
+    # Same-name repeated buys in a short window: only flag as review issue, not advice.
+    by_name = {}
+    for t in buys:
+        by_name.setdefault(t.get("name") or "--", []).append(t)
+    repeated = [(n, xs) for n, xs in by_name.items() if len(xs) >= 3]
+    if repeated:
+        n, xs = repeated[0]
+        discipline.append({
+            "problem": "同一标的多次买入",
+            "evidence": f"{n} 有{len(xs)}笔买入记录。",
+            "why": "适合复盘这些买入是否来自同一计划，而不是越跌越补或临场追涨。",
+        })
+    narrative = "\n".join([
+        summary,
+        "本地复盘只基于流水做客观归纳；AI 输出为空或格式异常时用于兜底，不包含未来买卖建议。",
+    ])
+    return {
+        "period": period,
+        "period_label": label,
+        "empty": False,
+        "summary": summary,
+        "good": good,
+        "discipline": discipline,
+        "binchuan": [],
+        "market_fit": market_fit,
+        "narrative": narrative,
+        "n_buy": nb,
+        "n_sell": ns,
+        "n_trades": len(ptrades),
+        "generated_at": time.time(),
+        "fallback": True,
+        "error": error,
+    }
+
+
+def _local_all_review(*, review: dict, journal: dict, data_block: str, error: str = "") -> dict:
+    import time
+    o = review.get("overview") or {}
+    stats = review.get("stats") or []
+    held = [s for s in stats if (s.get("shares") or 0) > 0]
+    closed = [s for s in stats if (s.get("shares") or 0) <= 0]
+    win_rate = round((o.get("win_rate") or 0) * 100)
+    summary = f"全周期交易过{o.get('n_stocks', 0)}个标的，胜率约{win_rate}%，当前仍持有{len(held)}只、已清仓{len(closed)}只。"
+    good = []
+    if any((s.get("realized") or 0) > 0 for s in closed):
+        good.append("已有赚钱清仓记录，说明部分交易能兑现结果。")
+    if (journal.get("sell_hit_rate") or 0) > 0.5:
+        good.append(f"卖出后回避下跌命中率约{round(journal.get('sell_hit_rate') * 100)}%。")
+    discipline = []
+    loss_held = [s for s in held if (s.get("floating", 0) + s.get("realized", 0)) < 0]
+    if loss_held:
+        worst = sorted(loss_held, key=lambda s: s.get("floating", 0) + s.get("realized", 0))[0]
+        discipline.append({
+            "problem": "仍有亏损持仓拖累",
+            "evidence": f"{worst.get('name')} 当前总盈亏约{(worst.get('floating',0)+worst.get('realized',0)):.0f}。",
+            "why": "需要复盘亏损持仓是否来自追高、补仓或持有周期过长。",
+        })
+    if (o.get("avg_hold_days") or 0) > 60:
+        discipline.append({
+            "problem": "平均持有周期偏长",
+            "evidence": f"平均持有约{o.get('avg_hold_days')}天。",
+            "why": "适合检查亏损票是否拿得比赚钱票更久。",
+        })
+    narrative = summary + "\n本地复盘根据真实流水、已实现盈亏和当前浮动盈亏生成；AI 输出为空或格式异常时用于兜底。"
+    return {
+        "period": "all", "period_label": "全周期", "empty": False,
+        "summary": summary,
+        "good": good,
+        "discipline": discipline,
+        "binchuan": [],
+        "narrative": narrative,
+        "stats": {
+            "win_rate": o.get("win_rate", 0), "buy_hit_rate": journal.get("buy_hit_rate", 0),
+            "sell_hit_rate": journal.get("sell_hit_rate", 0), "avg_hold_days": o.get("avg_hold_days", 0),
+            "n_stocks": o.get("n_stocks", 0),
+        },
+        "generated_at": time.time(),
+        "fallback": True,
+        "error": error,
+    }
+
+
 @router.get("/trade-review-ai")
 async def trade_review_ai(period: str = "all", force: int = 0):
     """LLM 交易纪律复盘。period: all(全周期总览) / day(当日) / week(本周) / month(本月)。
@@ -701,8 +816,17 @@ async def trade_review_ai(period: str = "all", force: int = 0):
         try:
             raw = await asyncio.to_thread(llm_client.call_claude, user_prompt, system_prompt, "smart", 1800)
         except Exception as e:
-            return {"period": period, "period_label": label, "error": str(e), "summary": "", "narrative": ""}
+            result = _local_period_review(period=period, label=label, ptrades=ptrades, nb=nb, ns=ns,
+                                          market_fit="", error=str(e))
+            _ai_review_cache[ck] = (result, time.time())
+            return result
         parsed = _parse_llm_json(raw)
+        if _looks_placeholder_review(parsed):
+            result = _local_period_review(period=period, label=label, ptrades=ptrades, nb=nb, ns=ns,
+                                          market_fit=parsed.get("market_fit", "") if isinstance(parsed, dict) else "",
+                                          error="AI 复盘输出为空或格式异常，已用本地复盘")
+            _ai_review_cache[ck] = (result, time.time())
+            return result
         result = {
             "period": period, "period_label": label, "empty": False,
             "summary": parsed.get("summary", ""),
@@ -952,9 +1076,16 @@ async def trade_review_ai(period: str = "all", force: int = 0):
     try:
         raw = await asyncio.to_thread(llm_client.call_claude, user_prompt, system_prompt, "smart", 4096)
     except Exception as e:
-        return {"narrative": "", "discipline": [], "summary": "", "error": str(e), "generated_at": None}
+        result = _local_all_review(review=review, journal=journal, data_block=data_block, error=str(e))
+        _ai_review_cache[ck] = (result, time.time())
+        return result
 
     parsed = _parse_llm_json(raw)
+    if _looks_placeholder_review(parsed):
+        result = _local_all_review(review=review, journal=journal, data_block=data_block,
+                                  error="AI 复盘输出为空或格式异常，已用本地复盘")
+        _ai_review_cache[ck] = (result, time.time())
+        return result
 
     result = {
         "period": "all", "period_label": "全周期", "empty": False,

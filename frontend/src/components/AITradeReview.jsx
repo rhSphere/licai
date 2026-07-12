@@ -90,6 +90,12 @@ export default function AITradeReview() {
             </div>
           )}
 
+          {d.fallback && (
+            <div className="text-[11px] text-text-muted mb-2">
+              AI 输出不可用，已展示本地规则复盘{d.error ? ` · ${String(d.error).slice(0, 80)}` : ''}
+            </div>
+          )}
+
           {/* 定性 */}
           {d.summary && (
             <div className="mb-3 px-3 py-2.5 rounded-lg bg-accent/10 border border-accent/30">

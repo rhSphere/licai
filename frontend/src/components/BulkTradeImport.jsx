@@ -26,6 +26,8 @@ const normalizeCode = (raw) => {
   return s
 }
 
+const normalizeDate = (raw) => String(raw || '').trim().replace(/[‐‑‒–—−]/g, '-')
+
 const splitLine = (line) => {
   const s = line.trim()
   if (!s) return []
@@ -45,9 +47,14 @@ const extractHeader = (line) => {
 
 const parseActionLine = (line, lineNo) => {
   const cols = splitLine(line)
-  if (cols.length < 4 || !/^\d{4}-\d{2}-\d{2}$/.test(cols[0])) return { skip: true }
-  const [trade_date, typeRaw, priceRaw, sharesRaw, ...restRaw] = cols
-  const action_type = normalizeType(typeRaw)
+  if (cols.length < 4) return { skip: true }
+  const [dateRaw, typeRaw, priceRaw, sharesRaw, ...restRaw] = cols
+  const trade_date = normalizeDate(dateRaw)
+  const maybeType = normalizeType(typeRaw)
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(trade_date)) {
+    return maybeType ? { errors: [`第 ${lineNo} 行: 日期需为 YYYY-MM-DD (${dateRaw})`] } : { skip: true }
+  }
+  const action_type = maybeType
   let price = Number(priceRaw)
   let shares = parseInt(sharesRaw, 10)
   const rest = [...restRaw]
@@ -76,6 +83,9 @@ const parseActionLine = (line, lineNo) => {
   if (!action_type) errors.push(`第 ${lineNo} 行: 类型无法识别 (${typeRaw})`)
   if (!(price >= 0)) errors.push(`第 ${lineNo} 行: 价格无效`)
   if (!(shares > 0)) errors.push(`第 ${lineNo} 行: 数量无效`)
+  if (action_type === 'DIVIDEND' && !(shares > 0)) {
+    errors.push(`第 ${lineNo} 行: 分红数量为 0 时, 请在最后一列填分红总额`)
+  }
   if (feeRaw !== '' && feeRaw !== '-' && !(fee >= 0)) errors.push(`第 ${lineNo} 行: 手续费无效`)
   if (errors.length) return { errors }
   return {
@@ -157,13 +167,14 @@ export default function BulkTradeImport({ onDone }) {
         <div className="p-4 space-y-3">
           <div className="flex flex-wrap items-center justify-between gap-2">
             <div className="text-[11px] text-text-muted leading-relaxed">
-              标题写 <span className="font-mono text-text">**名称（代码）**</span>, 下方每行 <span className="font-mono text-text">日期 类型 价格 数量 手续费 [时间]</span>。
-              已清仓标的也会自动创建历史占位行。
+              每个标的先写一行 <span className="font-mono text-text">名称（代码）</span>，不需要加粗；下面逐行粘贴
+              <span className="font-mono text-text"> 日期 类型 价格 数量 手续费 [时间]</span>。
+              分红总额写在最后一列；已清仓标的也会自动创建历史占位行。
             </div>
           </div>
           <textarea rows={12}
             className="w-full bg-bg border border-border rounded px-3 py-2 text-[12px] text-text font-mono outline-none focus:border-accent resize-y"
-            placeholder={'**半导体ETF国联安（512480）**\n```\n2026-01-23 卖出 1.705 1500 0.26\n2026-01-21 买入 1.749 1000 0.17\n```'}
+            placeholder={'半导体ETF国联安（512480）\n2026-01-23 卖出 1.705 1500 0.26\n2026-01-21 买入 1.749 1000 0.17\n\n建设银行（601939）\n2026-07-10 买入 10.030 2000 5.20 13:30:43\n2026-07-10 股息入账 0 0 0.00 16:00:00 142.53'}
             value={text} onChange={e => setText(e.target.value)} />
           <div className="flex items-center justify-between gap-3">
             <div className={`text-[11px] whitespace-pre-line ${parsed.errors.length ? 'text-bear' : 'text-text-muted'}`}>

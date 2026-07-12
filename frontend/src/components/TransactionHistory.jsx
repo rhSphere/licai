@@ -44,6 +44,8 @@ const splitBulkLine = (line) => {
   return s.split(/\s+/).map(x => x.trim())
 }
 
+const normalizeDate = (raw) => String(raw || '').trim().replace(/[‐‑‒–—−]/g, '-')
+
 function parseBulkActions(text, defaultBroker = '') {
   const rows = []
   const errors = []
@@ -56,7 +58,8 @@ function parseBulkActions(text, defaultBroker = '') {
       errors.push(`第 ${i + 1} 行: 至少需要 日期 类型 价格 数量`)
       continue
     }
-    const [trade_date, typeRaw, priceRaw, sharesRaw, ...restRaw] = cols
+    const [dateRaw, typeRaw, priceRaw, sharesRaw, ...restRaw] = cols
+    const trade_date = normalizeDate(dateRaw)
     const action_type = normalizeType(typeRaw)
     let price = Number(priceRaw)
     let shares = parseInt(sharesRaw, 10)

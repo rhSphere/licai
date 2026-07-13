@@ -11,38 +11,88 @@ function cellBg(pct) {
 const pctColor = (v) => v == null ? 'text-text-dim' : v > 0 ? 'text-bear-bright' : v < 0 ? 'text-bull-bright' : 'text-text-dim'
 
 // 客户端缓存: 刷新页面立刻显示上次结果, 不再每次都转圈重拉 (后端本就缓存, 这里只去掉前端闪烁)
-const CKEY = (dy) => `sectorMatrix_${dy}`
-const readCache = (dy) => { try { return JSON.parse(localStorage.getItem(CKEY(dy)) || 'null') } catch { return null } }
-const writeCache = (dy, m, ai) => { try { localStorage.setItem(CKEY(dy), JSON.stringify({ m, ai })) } catch {} }
+const CKEY = (dy, custom = '') => `sectorMatrix_${dy}_${custom}`
+const readCache = (dy, custom = '') => { try { return JSON.parse(localStorage.getItem(CKEY(dy, custom)) || 'null') } catch { return null } }
+const writeCache = (dy, custom, m, ai) => { try { localStorage.setItem(CKEY(dy, custom), JSON.stringify({ m, ai })) } catch {} }
+const parseCustom = (s) => String(s || '').replace(/，/g, ',').split(',').map(x => x.trim()).filter(Boolean)
 
 export default function SectorMatrix() {
   const [days, setDays] = useState(10)
-  const cached = readCache(10)
+  const [customText, setCustomText] = useState(() => localStorage.getItem('sectorMatrixCustom') || '')
+  const customKey = parseCustom(customText).join(',')
+  const cached = readCache(10, customKey)
   const [m, setM] = useState(cached?.m || null)
   const [ai, setAi] = useState(cached?.ai || null)
   const [loading, setLoading] = useState(!cached)
   const [aiLoading, setAiLoading] = useState(false)
+  const [sectorNames, setSectorNames] = useState([])
+  const [sortBy, setSortBy] = useState(() => localStorage.getItem('sectorMatrixSortBy') || 'cum')
+  const [sortDir, setSortDir] = useState(() => localStorage.getItem('sectorMatrixSortDir') || 'desc')
+  const [sectorCandidateLimit, setSectorCandidateLimit] = useState(6)
+
 
   const load = useCallback((dy, force = false) => {
-    const cache = readCache(dy)
+    const custom = parseCustom(customText).join(',')
+    try { localStorage.setItem('sectorMatrixCustom', customText) } catch {}
+    const cache = readCache(dy, custom)
     // 有缓存先秒显, 不显示 loading; 无缓存才转圈
     if (cache?.m) setM(cache.m)
     if (cache?.ai) setAi(cache.ai)
     setLoading(!cache?.m || force)
     let nm = cache?.m || null, na = cache?.ai || null
-    fetchJSON(`/api/sector/matrix?days=${dy}${force ? '&force=true' : ''}`)
-      .then(r => { nm = r; setM(r); writeCache(dy, nm, na) }).catch(() => {}).finally(() => setLoading(false))
-  }, [])
+    fetchJSON(`/api/sector/matrix?days=${dy}${force ? '&force=true' : ''}${custom ? `&custom=${encodeURIComponent(custom)}` : ''}`)
+      .then(r => { nm = r; setM(r); writeCache(dy, custom, nm, na) }).catch(() => {}).finally(() => setLoading(false))
+  }, [customText])
 
   const loadAi = useCallback((dy, force = false) => {
     setAiLoading(true)
-    let nm = readCache(dy)?.m || m
+    const custom = parseCustom(customText).join(',')
+    let nm = readCache(dy, custom)?.m || m
     let na = ai
-    fetchJSON(`/api/sector/trend-ai?days=${dy}${force ? '&force=true' : ''}`)
-      .then(r => { na = r; setAi(r); writeCache(dy, nm, na) }).catch(() => {}).finally(() => setAiLoading(false))
-  }, [ai, m])
+    fetchJSON(`/api/sector/trend-ai?days=${dy}${force ? '&force=true' : ''}${custom ? `&custom=${encodeURIComponent(custom)}` : ''}`)
+      .then(r => { na = r; setAi(r); writeCache(dy, custom, nm, na) }).catch(() => {}).finally(() => setAiLoading(false))
+  }, [ai, m, customText])
 
   useEffect(() => { load(days) }, [days, load])
+  useEffect(() => {
+    fetchJSON('/api/sector/matrix/sectors')
+      .then(r => setSectorNames(r.sectors || []))
+      .catch(() => {})
+  }, [])
+
+  const selectedCustom = parseCustom(customText)
+  const addCustom = (name) => {
+    const n = String(name || '').trim()
+    if (!n) return
+    const next = Array.from(new Set([...parseCustom(customText), n]))
+    setCustomText(next.join(', '))
+  }
+  const query = customText.split(/[,，]/).pop().trim()
+  const suggestions = sectorNames
+    .filter(n => !selectedCustom.includes(n))
+    .filter(n => !query || n.includes(query))
+  const common = ['银行', '证券', '保险', '通信设备', '互联网电商', '半导体', '消费电子', '工业金属', '贵金属', '小金属']
+    .filter(n => sectorNames.includes(n) && !selectedCustom.includes(n))
+  const candidatePool = suggestions.length ? suggestions : common
+  const shownCandidates = candidatePool.slice(0, sectorCandidateLimit)
+  const remainingCandidates = Math.max(0, candidatePool.length - shownCandidates.length)
+
+  const setSort = (field) => {
+    if (sortBy === field) {
+      const next = sortDir === 'desc' ? 'asc' : 'desc'
+      setSortDir(next); try { localStorage.setItem('sectorMatrixSortDir', next) } catch {}
+    } else {
+      setSortBy(field); setSortDir('desc')
+      try { localStorage.setItem('sectorMatrixSortBy', field); localStorage.setItem('sectorMatrixSortDir', 'desc') } catch {}
+    }
+  }
+  const sortedRows = [...(m?.rows || [])].sort((a, b) => {
+    const key = sortBy === 'today' ? 'today_pct' : sortBy === 'inflow' ? 'net_inflow' : 'cum_pct'
+    const av = Number(a[key] ?? -9999)
+    const bv = Number(b[key] ?? -9999)
+    return sortDir === 'desc' ? bv - av : av - bv
+  })
+  const sortMark = (field) => sortBy === field ? (sortDir === 'desc' ? '↓' : '↑') : ''
 
   if (loading && !m) return <SkeletonCard rows={6} label="板块矩阵计算中(首次约20-40秒)" />
   if (!m || !(m.rows || []).length) return null
@@ -58,6 +108,19 @@ export default function SectorMatrix() {
           )}
         </div>
         <div className="flex gap-1 items-center">
+          <span className="text-[10.5px] text-text-muted mr-1">排序</span>
+          <button onClick={() => setSort('today')}
+            className={`text-[11px] px-2 py-0.5 rounded border ${sortBy === 'today' ? 'bg-accent/20 text-accent border-accent/40' : 'bg-surface-3 text-text-dim border-transparent hover:text-text'}`}>
+            今日{sortMark('today')}
+          </button>
+          <button onClick={() => setSort('cum')}
+            className={`text-[11px] px-2 py-0.5 rounded border ${sortBy === 'cum' ? 'bg-accent/20 text-accent border-accent/40' : 'bg-surface-3 text-text-dim border-transparent hover:text-text'}`}>
+            累计{sortMark('cum')}
+          </button>
+          <button onClick={() => setSort('inflow')}
+            className={`text-[11px] px-2 py-0.5 rounded border ${sortBy === 'inflow' ? 'bg-accent/20 text-accent border-accent/40' : 'bg-surface-3 text-text-dim border-transparent hover:text-text'}`}>
+            净流入{sortMark('inflow')}
+          </button>
           {[10, 20].map(dy => (
             <button key={dy} onClick={() => setDays(dy)}
               className={`text-[11px] px-2 py-0.5 rounded border ${days === dy ? 'bg-accent/20 text-accent border-accent/40' : 'bg-surface-3 text-text-dim border-transparent hover:text-text'}`}>
@@ -73,6 +136,38 @@ export default function SectorMatrix() {
             {aiLoading ? 'AI中…' : 'AI分析'}
           </button>
         </div>
+      </div>
+
+      <div className="flex flex-wrap items-center gap-2 mb-3 text-[11px]">
+        <span className="text-text-muted">自选板块</span>
+        <input value={customText} onChange={e => setCustomText(e.target.value)}
+          placeholder="如: 银行, 互联网电商, 通信设备"
+          className="flex-1 min-w-[220px] bg-bg border border-border rounded px-2 py-1 text-[11px] text-text outline-none focus:border-accent" />
+        <button onClick={() => load(days, true)} disabled={loading}
+          className="px-2 py-1 rounded border border-border text-text-dim hover:text-text disabled:opacity-40">应用</button>
+        {!!customKey && <span className="text-text-muted">已加: {customKey}</span>}
+      </div>
+      <div className="flex flex-wrap items-center gap-1.5 mb-3 text-[10.5px]">
+        <span className="text-text-muted">候选</span>
+        {shownCandidates.map(n => (
+          <button key={n} onClick={() => addCustom(n)}
+            className="px-1.5 py-[1px] rounded border border-border text-text-dim hover:text-accent hover:border-accent/50">
+            +{n}
+          </button>
+        ))}
+        {remainingCandidates > 0 && (
+          <button onClick={() => setSectorCandidateLimit(v => Math.min(v + 24, candidatePool.length))}
+            className="px-1.5 py-[1px] rounded border border-accent/30 text-accent hover:bg-accent/10">
+            更多{remainingCandidates}
+          </button>
+        )}
+        {sectorCandidateLimit > 6 && (
+          <button onClick={() => setSectorCandidateLimit(6)}
+            className="px-1.5 py-[1px] rounded border border-border text-text-dim hover:text-text">
+            收起
+          </button>
+        )}
+        {!sectorNames.length && <span className="text-text-muted">板块名加载中…</span>}
       </div>
 
       {/* AI 趋势分析 */}
@@ -103,21 +198,21 @@ export default function SectorMatrix() {
             <col style={{ width: 56 }} />
             <col style={{ width: 56 }} />
             <col style={{ width: 64 }} />
-            {(m.dates || []).map((_, i) => <col key={i} />)}
+            {([...(m.dates || [])].reverse()).map((_, i) => <col key={i} />)}
           </colgroup>
           <thead>
             <tr className="text-text-muted text-[10.5px]">
               <th className="text-left font-normal sticky left-0 bg-surface-2 pr-2 z-10 pb-1">板块</th>
-              <th className="font-normal px-1 text-right pb-1">今日</th>
-              <th className="font-normal px-1 text-right pb-1">累计</th>
-              <th className="font-normal px-1 text-right pb-1">净流入</th>
-              {(m.dates || []).map((d, i) => (
+              <th className="font-normal px-1 text-right pb-1 cursor-pointer hover:text-accent" onClick={() => setSort('today')}>今日{sortMark('today')}</th>
+              <th className="font-normal px-1 text-right pb-1 cursor-pointer hover:text-accent" onClick={() => setSort('cum')}>累计{sortMark('cum')}</th>
+              <th className="font-normal px-1 text-right pb-1 cursor-pointer hover:text-accent" onClick={() => setSort('inflow')}>净流入{sortMark('inflow')}</th>
+              {([...(m.dates || [])].reverse()).map((d, i) => (
                 <th key={i} className={`text-center pb-1 ${m.intraday && d === m.today ? 'text-bear-bright font-semibold' : 'font-normal'}`}>{d}</th>
               ))}
             </tr>
           </thead>
           <tbody>
-            {m.rows.map((r, ri) => (
+            {sortedRows.map((r, ri) => (
               <tr key={ri} className="border-t border-border-subtle/30">
                 <td className="text-text-bright whitespace-nowrap truncate sticky left-0 bg-surface-2 pr-2 z-10 py-1.5">
                   {r.name}{r.streak >= 2 && <span className="text-bear-bright ml-1 text-[10px]">↑{r.streak}</span>}
@@ -125,7 +220,7 @@ export default function SectorMatrix() {
                 <td className={`px-1 text-right font-mono ${pctColor(r.today_pct)}`}>{r.today_pct >= 0 ? '+' : ''}{r.today_pct}</td>
                 <td className={`px-1 text-right font-mono font-semibold ${pctColor(r.cum_pct)}`}>{r.cum_pct >= 0 ? '+' : ''}{r.cum_pct}</td>
                 <td className={`px-1 text-right font-mono ${pctColor(r.net_inflow)}`}>{r.net_inflow >= 0 ? '+' : ''}{r.net_inflow}亿</td>
-                {(r.daily || []).map((c, ci) => (
+                {([...(r.daily || [])].reverse()).map((c, ci) => (
                   <td key={ci} className="text-center font-mono px-1 py-1.5 rounded-sm" title={`${c.date} ${c.pct >= 0 ? '+' : ''}${c.pct}%`}
                     style={{ background: cellBg(c.pct), color: Math.abs(c.pct) > 1.5 ? '#fff' : 'var(--color-text-dim)' }}>
                     {c.pct >= 0 ? '+' : ''}{c.pct.toFixed(1)}
@@ -138,7 +233,7 @@ export default function SectorMatrix() {
       </div>
 
       <div className="text-[10px] text-text-muted pt-2.5 mt-2 border-t border-border-subtle">
-        同花顺行业 · 按近 {m.days} 日累计涨幅排序 · ↑N=连涨天数 · 纯客观, 不构成买卖建议
+        同花顺行业 · 净流入为今日实时榜口径 · 当前按{sortBy === 'today' ? '今日涨跌幅' : sortBy === 'inflow' ? '今日净流入' : `近 ${m.days} 日累计涨幅`}{sortDir === 'desc' ? '降序' : '升序'}排序 · ↑N=连涨天数 · 纯客观, 不构成买卖建议
       </div>
     </div>
   )

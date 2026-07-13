@@ -11,7 +11,7 @@ from pydantic import BaseModel
 
 from database import get_all_holdings
 from services.sector_compare import get_sector_compare
-from services.sector_matrix import get_sector_matrix
+from services.sector_matrix import get_sector_matrix, get_sector_names
 from services.sector_scanner import scan_sectors
 from services.sector_us import scan_us_sectors
 from services.sector_hk import scan_hk_sectors
@@ -48,25 +48,37 @@ async def compare_all(force: bool = False):
     return {"holdings": out}
 
 
+def _parse_custom_sectors(custom: str = "") -> list[str]:
+    return [x.strip() for x in (custom or "").replace("，", ",").split(",") if x.strip()][:20]
+
+
 @router.get("/matrix")
-async def sector_matrix(days: int = 10, force: bool = False):
+async def sector_matrix(days: int = 10, force: bool = False, custom: str = ""):
     """板块趋势量化矩阵: 板块 × 过去 N 个交易日 日涨跌幅 + N日累计/净流入/动能。"""
-    return await get_sector_matrix(days=days, force=force)
+    return await get_sector_matrix(days=days, force=force, extra_sectors=_parse_custom_sectors(custom))
+
+
+@router.get("/matrix/sectors")
+async def sector_matrix_names(force: bool = False):
+    """合法同花顺行业板块名列表, 用于自选板块输入提示。"""
+    names = await get_sector_names(force=force)
+    return {"sectors": names, "count": len(names)}
 
 
 _trend_cache: dict = {}
 
 
 @router.get("/trend-ai")
-async def sector_trend_ai(days: int = 10, force: bool = False):
+async def sector_trend_ai(days: int = 10, force: bool = False, custom: str = ""):
     """基于量化矩阵的板块趋势 AI 分析: 走强/退潮/轮动/资金流向 + 跟持仓关系。纯客观, 不给买卖建议。"""
     import time as _t
-    ck = f"trend_{days}"
+    custom_sectors = _parse_custom_sectors(custom)
+    ck = f"trend_{days}_{'|'.join(sorted(custom_sectors))}"
     c = _trend_cache.get(ck)
     if not force and c and _t.time() - c[1] < 1800:
         return c[0]
 
-    m = await get_sector_matrix(days=days)
+    m = await get_sector_matrix(days=days, extra_sectors=custom_sectors)
     rows = m.get("rows") or []
     if not rows:
         return {"summary": "", "trends": [], "holdings_note": "", "generated_at": None}

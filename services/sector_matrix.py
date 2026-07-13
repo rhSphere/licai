@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 
 _cache: dict = {}
 _TTL = 7200  # 2h
+_sector_names_cache: tuple[list[str], float] | None = None
 
 # 始终纳入(贴用户有色/小金属持仓 + 关键题材), 即使今天不在涨幅榜前列
 _ALWAYS = ["小金属", "工业金属", "贵金属", "能源金属", "半导体", "光伏设备"]
@@ -46,7 +47,7 @@ def _vol_price_read(daily: list, cum: float):
     return vt, tag
 
 
-def _fetch_matrix_sync(days: int) -> dict | None:
+def _fetch_matrix_sync(days: int, extra_sectors: list[str] | None = None) -> dict | None:
     _strip_proxy()
     import akshare as ak
 
@@ -74,7 +75,8 @@ def _fetch_matrix_sync(days: int) -> dict | None:
     strongest = [n for n, _ in ranked[:14]]
     weakest = [n for n, _ in ranked[-4:]]
     universe, seen = [], set()
-    for n in strongest + _ALWAYS + weakest:
+    extras = [str(x or "").strip() for x in (extra_sectors or []) if str(x or "").strip()]
+    for n in strongest + _ALWAYS + extras + weakest:
         if n in today and n not in seen:
             seen.add(n); universe.append(n)
 
@@ -184,14 +186,46 @@ async def sector_matrix_prewarm_loop():
         await asyncio.sleep(interval)
 
 
-async def get_sector_matrix(days: int = 10, force: bool = False) -> dict:
+async def get_sector_matrix(days: int = 10, force: bool = False, extra_sectors: list[str] | None = None) -> dict:
     days = max(5, min(int(days or 10), 20))
-    ck = f"matrix_{days}"
+    extras = [str(x or "").strip() for x in (extra_sectors or []) if str(x or "").strip()]
+    extras = sorted(dict.fromkeys(extras))[:20]
+    ck = f"matrix_{days}_{'|'.join(extras)}"
     c = _cache.get(ck)
     if not force and c and time.time() - c[1] < _TTL:
         return c[0]
-    r = await asyncio.to_thread(_fetch_matrix_sync, days)
+    r = await asyncio.to_thread(_fetch_matrix_sync, days, extras)
     if r:
         _cache[ck] = (r, time.time())
         return r
     return c[0] if c else {"days": days, "dates": [], "rows": []}
+
+
+def _fetch_sector_names_sync() -> list[str]:
+    """Fetch all legal THS industry board names for autocomplete."""
+    _strip_proxy()
+    import akshare as ak
+    summ = ak.stock_board_industry_summary_ths()
+    if summ is None or not len(summ):
+        return []
+    names = []
+    for _, r in summ.iterrows():
+        nm = str(r.get("板块") or "").strip()
+        if nm and nm not in names:
+            names.append(nm)
+    return sorted(names)
+
+
+async def get_sector_names(force: bool = False) -> list[str]:
+    """All legal THS industry board names, cached for autocomplete."""
+    global _sector_names_cache
+    if not force and _sector_names_cache and time.time() - _sector_names_cache[1] < _TTL:
+        return _sector_names_cache[0]
+    try:
+        names = await asyncio.to_thread(_fetch_sector_names_sync)
+        if names:
+            _sector_names_cache = (names, time.time())
+            return names
+    except Exception:
+        pass
+    return _sector_names_cache[0] if _sector_names_cache else []

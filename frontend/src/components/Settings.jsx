@@ -201,6 +201,11 @@ export default function Settings({ onClose }) {
           <LLMConfigSection />
         </div>
 
+        {/* 风控配置 */}
+        <div className="mt-2 pt-4 border-t border-border">
+          <RiskConfigSection />
+        </div>
+
         {/* 数据备份 */}
         <div className="mt-2 pt-4 border-t border-border">
           <DataBackup />
@@ -568,5 +573,67 @@ function LLMConfigSection() {
         )}
       </div>
     </>
+  )
+}
+
+function RiskConfigSection() {
+  const [amount, setAmount] = useState('500')
+  const [pct, setPct] = useState('1')
+  const [status, setStatus] = useState({ text: '', ok: null })
+  const [saving, setSaving] = useState(false)
+
+  useEffect(() => {
+    fetchJSON('/api/settings/risk').then(d => {
+      setAmount(String(d.max_daily_loss ?? 500))
+      setPct(String(((d.max_daily_loss_pct ?? 0.01) * 100).toFixed(2).replace(/\.00$/, '')))
+    }).catch(() => {})
+  }, [])
+
+  const save = async () => {
+    setSaving(true); setStatus({ text: '保存中...', ok: null })
+    try {
+      await fetchJSON('/api/settings/risk', {
+        method: 'POST',
+        body: JSON.stringify({
+          max_daily_loss: parseFloat(amount) || 0,
+          max_daily_loss_pct: (parseFloat(pct) || 0) / 100,
+        }),
+      })
+      setStatus({ text: '已保存', ok: true })
+    } catch (e) {
+      setStatus({ text: '保存失败: ' + (e.message || e), ok: false })
+    } finally { setSaving(false) }
+  }
+
+  return (
+    <div>
+      <label className="text-[12px] text-text-dim font-semibold">风控阈值</label>
+      <p className="text-[11px] text-text-muted mt-1 mb-2 leading-relaxed">
+        触发阈值取“固定金额”和“持仓市值比例”两者中较大值；今日浮亏按人民币口径估算。
+      </p>
+      <div className="grid grid-cols-2 gap-2 mb-2">
+        <div>
+          <label className="text-[11px] text-text-muted">单日浮亏金额 ¥</label>
+          <input type="number" step="1" min="0" value={amount} onChange={e => setAmount(e.target.value)}
+            className="w-full bg-bg border border-border rounded px-3 py-1.5 text-[12px] text-text font-mono outline-none focus:border-accent" />
+        </div>
+        <div>
+          <label className="text-[11px] text-text-muted">单日回撤比例 %</label>
+          <input type="number" step="0.1" min="0" value={pct} onChange={e => setPct(e.target.value)}
+            className="w-full bg-bg border border-border rounded px-3 py-1.5 text-[12px] text-text font-mono outline-none focus:border-accent" />
+        </div>
+      </div>
+      <div className="flex items-center gap-3">
+        <button onClick={save} disabled={saving}
+          className="px-4 py-1.5 rounded-md bg-accent text-bg font-medium text-[13px] hover:opacity-90 disabled:opacity-50 cursor-pointer">
+          {saving ? '保存中...' : '保存风控'}
+        </button>
+        {status.text && (
+          <span className={`text-[12px] ${status.ok === true ? 'text-bull' : status.ok === false ? 'text-bear' : 'text-text-dim'}`}>
+            {status.text}
+          </span>
+        )}
+      </div>
+    </div>
   )
 }

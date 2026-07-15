@@ -159,18 +159,25 @@ async def test_feishu():
 
 class RiskConfig(BaseModel):
     max_daily_loss: Optional[float] = None
+    max_daily_loss_pct: Optional[float] = None
 
 
 @router.get("/risk")
 async def get_risk_config():
     val = await get_config("max_daily_loss")
-    return {"max_daily_loss": float(val) if val else 500}
+    pct = await get_config("max_daily_loss_pct")
+    return {
+        "max_daily_loss": float(val) if val else 500,
+        "max_daily_loss_pct": float(pct) if pct else 0.01,
+    }
 
 
 @router.post("/risk")
 async def save_risk_config(data: RiskConfig):
     if data.max_daily_loss is not None:
         await set_config("max_daily_loss", str(data.max_daily_loss))
+    if data.max_daily_loss_pct is not None:
+        await set_config("max_daily_loss_pct", str(data.max_daily_loss_pct))
     return {"message": "保存成功"}
 
 

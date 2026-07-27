@@ -246,6 +246,16 @@ _WHY_SYS = (
 _MARKET_CN = {"A": "A股", "HK": "港股", "US": "美股"}
 
 
+def _strip_thinking_text(text: str) -> str:
+    """Remove MiniMax/Qwen style thinking traces before displaying."""
+    import re
+    s = text or ""
+    s = re.sub(r"<think>.*?</think>", "", s, flags=re.DOTALL | re.IGNORECASE)
+    # Some streams may only contain opening tag in captured text; drop from tag to end.
+    s = re.sub(r"<think>.*", "", s, flags=re.DOTALL | re.IGNORECASE)
+    return s.strip()
+
+
 @router.post("/why")
 async def sector_why(data: WhyIn):
     hour = _dt.now().strftime("%Y-%m-%d-%H")
@@ -277,19 +287,20 @@ async def sector_why(data: WhyIn):
         + "\n\n请据此按要求输出 JSON。"
     )
     try:
-        raw = await asyncio.to_thread(_llm.call_claude, user_prompt, _WHY_SYS, "balanced", 500)
+        raw = await asyncio.to_thread(_llm.call_claude, user_prompt, _WHY_SYS, "balanced", 500, "json_object")
     except Exception:
         return {"why": "", "relation": "", "error": "解读暂不可用", "cached": False}
+    raw_clean = _strip_thinking_text(raw)
     parsed = None
     try:
-        s = raw.strip()
+        s = raw_clean.strip()
         i, j = s.find("{"), s.rfind("}")
         if i >= 0 and j > i:
             parsed = _json.loads(s[i:j + 1])
     except Exception:
         parsed = None
     if not isinstance(parsed, dict):
-        parsed = {"why": raw.strip()[:300], "relation": ""}
+        parsed = {"why": raw_clean[:300], "relation": ""}
     out = {
         "why": str(parsed.get("why") or "").strip(),
         "relation": str(parsed.get("relation") or "").strip(),

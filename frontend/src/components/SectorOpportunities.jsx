@@ -51,20 +51,27 @@ export default function SectorOpportunities() {
   const [filter, setFilter] = useState(() => localStorage.getItem('sectorScanFilter') || 'unheld')
   const [sortKey, setSortKey] = useState(() => localStorage.getItem('sectorScanSort') || '5d')
   const [openSector, setOpenSector] = useState(null)
-  const [whyOpen, setWhyOpen] = useState(null)
+  const [whyOpen, setWhyOpen] = useState({})
   const [whyData, setWhyData] = useState({})
-  const toggleWhy = (r) => {
-    if (whyOpen === r.name) { setWhyOpen(null); return }
-    setWhyOpen(r.name)
+  const loadWhy = (r, force = false) => {
     const k = `${market}:${r.name}`
-    if (whyData[k]) return
+    if (!force && whyData[k]) return
     setWhyData(d => ({ ...d, [k]: { loading: true } }))
     fetch('/api/sector/why', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ market, name: r.name, change_1d: r.change_1d, change_5d: r.change_5d, held: !!r.held, leader: r.leader || null }),
-    }).then(res => res.json())
-      .then(j => setWhyData(d => ({ ...d, [k]: j })))
-      .catch(() => setWhyData(d => ({ ...d, [k]: { error: '解读暂不可用' } })))
+    }).then(async res => {
+      const j = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(j.detail || j.error || `HTTP ${res.status}`)
+      if (j.error) throw new Error(j.error)
+      setWhyData(d => ({ ...d, [k]: j }))
+    }).catch(e => setWhyData(d => ({ ...d, [k]: { error: e.message || '解读暂不可用' } })))
+  }
+  const toggleWhy = (r) => {
+    const k = `${market}:${r.name}`
+    const nextOpen = !whyOpen[k]
+    setWhyOpen(prev => ({ ...prev, [k]: nextOpen }))
+    if (nextOpen) loadWhy(r)
   }
 
   const cfg = MARKETS[market] || MARKETS.A
@@ -256,7 +263,7 @@ export default function SectorOpportunities() {
                 )}
                 <button onClick={() => toggleWhy(r)}
                   className="ml-1.5 text-[10px] px-1 py-[1px] rounded border border-border-med text-text-dim hover:text-accent hover:border-accent cursor-pointer shrink-0">
-                  为什么动
+                  {whyOpen[`${market}:${r.name}`] ? '收起原因' : '为什么动'}
                 </button>
               </div>
               <div className={`text-right font-mono licai-md-only ${colorOf(r.change_1d)}`}>
@@ -301,7 +308,7 @@ export default function SectorOpportunities() {
                 </button>
               </div>
             </div>
-            {whyOpen === r.name && (() => {
+            {whyOpen[`${market}:${r.name}`] && (() => {
               const w = whyData[`${market}:${r.name}`]
               return (
                 <div className="px-3 md:px-5 pb-2.5 -mt-1">
@@ -309,7 +316,15 @@ export default function SectorOpportunities() {
                     {!w || w.loading ? (
                       <div className="text-[11px] text-text-dim animate-pulse">解读生成中…</div>
                     ) : w.error ? (
-                      <div className="text-[11px] text-text-dim">解读暂不可用</div>
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="text-[11px] text-bear-bright">解读失败：{String(w.error).slice(0, 120)}</div>
+                        <button onClick={() => loadWhy(r, true)} className="text-[10px] px-1.5 py-[1px] rounded border border-border text-text-dim hover:text-accent">重试</button>
+                      </div>
+                    ) : !w.why && !w.relation ? (
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="text-[11px] text-text-dim">未生成有效解读（模型返回为空或无关内容）</div>
+                        <button onClick={() => loadWhy(r, true)} className="text-[10px] px-1.5 py-[1px] rounded border border-border text-text-dim hover:text-accent">重试</button>
+                      </div>
                     ) : (
                       <>
                         {w.why && <div className="text-[11.5px] text-text"><span className="text-accent">为什么动 · </span>{w.why}</div>}

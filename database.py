@@ -617,7 +617,7 @@ async def init_db():
             await db.execute(
                 "INSERT OR IGNORE INTO app_config (key, value) VALUES "
                 "('watchlist_default_group_filled', '1')")
-cursor = await db.execute("PRAGMA table_info(holdings)")
+        cursor = await db.execute("PRAGMA table_info(holdings)")
         holding_cols = {row[1] for row in await cursor.fetchall()}
         if "cost_price_override" not in holding_cols:
             # 用户手动覆盖的券商 App 成本价. NULL = 按流水自动计算.
